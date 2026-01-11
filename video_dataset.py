@@ -258,8 +258,9 @@ class SSV2Dataset(IterableDataset):
 
     def _iter_train(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Training iterator with shuffling."""
-        # Shuffle samples
-        indices = self._rng.permutation(len(self.samples))
+        # Create epoch-specific RNG for shuffling (works with persistent workers)
+        epoch_rng = np.random.Generator(np.random.Philox(seed=self._base_seed + self._epoch * 1000))
+        indices = epoch_rng.permutation(len(self.samples))
 
         # Shard across distributed ranks FIRST
         rank = self.config.rank
@@ -375,7 +376,7 @@ def create_ssv2_dataloader(
         num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=num_workers > 0
+        persistent_workers=False  # Must be False for set_epoch() to work with IterableDataset
     )
 
     return dataloader, dataset.metadata
