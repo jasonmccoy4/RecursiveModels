@@ -334,12 +334,13 @@ def evaluate(
             batch_size = labels.shape[0]
 
             # Extract V-JEPA 2 features
-            processed = train_state.vjepa_extractor.processor(
+            processed = train_state.vjepa_extractor.preprocess(
                 video_frames,
                 return_tensors="pt"
             )
             pixel_values = processed["pixel_values_videos"].to("cuda")
             vjepa_features = train_state.vjepa_extractor(pixel_values)
+            vjepa_features = vjepa_features.to(torch.bfloat16)
 
             seq_len = vjepa_features.shape[1]
 
