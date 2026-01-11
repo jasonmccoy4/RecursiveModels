@@ -87,7 +87,7 @@ def _load_video_decord(video_path: str, frame_indices: np.ndarray) -> torch.Tens
     """Load video using decord (fallback)."""
     from decord import VideoReader, cpu
 
-    vr = VideoReader(video_path, ctx=cpu(0))
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
     frames = vr.get_batch(frame_indices).asnumpy()
     frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # (T, H, W, C) -> (T, C, H, W)
     return frames
@@ -96,7 +96,7 @@ def _load_video_decord(video_path: str, frame_indices: np.ndarray) -> torch.Tens
 def _get_video_frame_count_decord(video_path: str) -> int:
     """Get total frame count using decord."""
     from decord import VideoReader, cpu
-    vr = VideoReader(video_path, ctx=cpu(0))
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
     return len(vr)
 
 

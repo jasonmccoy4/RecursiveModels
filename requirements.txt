@@ -1,5 +1,5 @@
 torch
-adam-atan2
+adam-atan2-pytorch
 einops
 tqdm
 coolname
@@ -18,3 +18,4 @@ pydantic-core
 huggingface_hub 
 numba
 triton
+pyyaml

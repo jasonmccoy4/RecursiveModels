@@ -97,8 +97,8 @@ class VideoAugmentor:
         Returns:
             Augmented frames of shape (T, C, target_size, target_size)
         """
-        # Ensure float for processing
-        frames = frames.float()
+        # Ensure float and contiguous for processing
+        frames = frames.float().contiguous()
 
         # 1. Spatial cropping (RandomResizedCrop or center crop)
         if self.config.random_resized_crop:
@@ -149,8 +149,8 @@ class VideoAugmentor:
         top = self._rng.integers(0, max(1, H - crop_h + 1))
         left = self._rng.integers(0, max(1, W - crop_w + 1))
 
-        # Crop and resize
-        frames = frames[:, :, top:top+crop_h, left:left+crop_w]
+        # Crop and resize - make contiguous after slicing
+        frames = frames[:, :, top:top+crop_h, left:left+crop_w].contiguous()
         frames = F.interpolate(
             frames,
             size=(target_size, target_size),
@@ -164,11 +164,11 @@ class VideoAugmentor:
         """Center crop to square and resize."""
         T, C, H, W = frames.shape
 
-        # Center crop to square
+        # Center crop to square - make contiguous after slicing
         min_dim = min(H, W)
         top = (H - min_dim) // 2
         left = (W - min_dim) // 2
-        frames = frames[:, :, top:top+min_dim, left:left+min_dim]
+        frames = frames[:, :, top:top+min_dim, left:left+min_dim].contiguous()
 
         # Resize
         if frames.shape[-1] != target_size:
@@ -248,7 +248,8 @@ class VideoAugmentor:
         """Convert to grayscale while maintaining 3 channels."""
         # Standard grayscale weights
         gray = 0.299 * frames[:, 0:1] + 0.587 * frames[:, 1:2] + 0.114 * frames[:, 2:3]
-        return gray.expand(-1, 3, -1, -1)
+        # Use repeat instead of expand to create contiguous memory
+        return gray.repeat(1, 3, 1, 1)
 
     def _gaussian_blur(self, frames: torch.Tensor) -> torch.Tensor:
         """Apply Gaussian blur consistently across all frames."""
@@ -260,25 +261,30 @@ class VideoAugmentor:
         if kernel_size % 2 == 0:
             kernel_size += 1
 
+        # Ensure contiguous for reshape operations
+        frames = frames.contiguous()
+
         # Create Gaussian kernel
         x = torch.arange(kernel_size, dtype=frames.dtype, device=frames.device) - kernel_size // 2
         kernel_1d = torch.exp(-x**2 / (2 * sigma**2))
         kernel_1d = kernel_1d / kernel_1d.sum()
-        kernel_2d = kernel_1d.view(-1, 1) @ kernel_1d.view(1, -1)
-        kernel_2d = kernel_2d.expand(3, 1, -1, -1)
+        # Use reshape instead of view for compatibility with non-contiguous tensors
+        kernel_2d = kernel_1d.reshape(-1, 1) @ kernel_1d.reshape(1, -1)
+        kernel_2d = kernel_2d.unsqueeze(0).unsqueeze(0)  # (1, 1, K, K)
 
         # Apply blur
         padding = kernel_size // 2
         T, C, H, W = frames.shape
 
-        # Process each frame
+        # Process each frame - use reshape instead of view
+        frames_reshaped = frames.reshape(T * C, 1, H, W)
         frames_blurred = F.conv2d(
-            frames.view(T * C, 1, H, W),
-            kernel_2d[0:1],
+            frames_reshaped,
+            kernel_2d,
             padding=padding,
             groups=1
         )
-        frames_blurred = frames_blurred.view(T, C, H, W)
+        frames_blurred = frames_blurred.reshape(T, C, H, W)
 
         return frames_blurred
 
@@ -289,6 +295,8 @@ class VideoAugmentor:
         Erases a random rectangle and fills with random values.
         Applied consistently across all frames for temporal coherence.
         """
+        # Clone to avoid in-place issues with non-contiguous tensors
+        frames = frames.clone()
         T, C, H, W = frames.shape
 
         # Sample erasing region
@@ -304,11 +312,12 @@ class VideoAugmentor:
             left = self._rng.integers(0, W - erase_w)
 
             # Fill with random values (same across frames for temporal consistency)
+            # Use repeat instead of expand for contiguous memory
             fill_value = torch.from_numpy(
                 self._rng.uniform(0, 255, size=(1, C, erase_h, erase_w))
             ).to(frames.dtype).to(frames.device)
 
-            frames[:, :, top:top+erase_h, left:left+erase_w] = fill_value.expand(T, -1, -1, -1)
+            frames[:, :, top:top+erase_h, left:left+erase_w] = fill_value.repeat(T, 1, 1, 1)
 
         return frames
 

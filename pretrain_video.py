@@ -454,14 +454,16 @@ def launch(hydra_config: DictConfig):
     # Create model
     model, optimizer = create_model(config, train_metadata, RANK, WORLD_SIZE)
 
-    # Estimate total steps
+    # Estimate total steps and batches
     estimated_samples_per_epoch = train_metadata.total_samples
-    steps_per_epoch = estimated_samples_per_epoch // config.global_batch_size
-    total_steps = steps_per_epoch * config.epochs // config.gradient_accumulation_steps
+    batches_per_epoch = estimated_samples_per_epoch // config.global_batch_size
+    total_batches = batches_per_epoch * config.epochs
+    total_steps = total_batches // config.gradient_accumulation_steps
 
     if RANK == 0:
-        print(f"Estimated steps per epoch: {steps_per_epoch}")
-        print(f"Total training steps: {total_steps}")
+        print(f"Estimated batches per epoch: {batches_per_epoch}")
+        print(f"Total batches: {total_batches}")
+        print(f"Total optimizer steps: {total_steps}")
 
     # Training state
     train_state = TrainState(
@@ -486,7 +488,7 @@ def launch(hydra_config: DictConfig):
     # Training loop
     progress_bar = None
     if RANK == 0:
-        progress_bar = tqdm.tqdm(total=total_steps, desc="Training")
+        progress_bar = tqdm.tqdm(total=batches_per_epoch, desc="Training")
 
     for epoch in range(config.epochs):
         train_state.epoch = epoch
