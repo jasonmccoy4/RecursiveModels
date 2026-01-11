@@ -167,3 +167,74 @@ def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tens
     variance = hidden_states.square().mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
     return hidden_states.to(input_dtype)
+
+
+class CrossAttentionPooler(nn.Module):
+    """
+    Cross-attention module where a query vector attends over key-value features.
+    Used to pool V-JEPA 2 spatial-temporal features into a single classification vector.
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        key_value_dim: int,
+        num_heads: int,
+        hidden_size: int,
+        dropout: float = 0.0
+    ):
+        super().__init__()
+
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.hidden_size = hidden_size
+        self.scale = self.head_dim ** -0.5
+
+        # Query projection from recursive model output
+        self.q_proj = CastedLinear(query_dim, hidden_size, bias=False)
+
+        # Key/Value projections from V-JEPA 2 features
+        self.k_proj = CastedLinear(key_value_dim, hidden_size, bias=False)
+        self.v_proj = CastedLinear(key_value_dim, hidden_size, bias=False)
+
+        # Output projection
+        self.o_proj = CastedLinear(hidden_size, hidden_size, bias=False)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        query: torch.Tensor,      # (B, 1, query_dim) - from recursive model
+        key_value: torch.Tensor   # (B, S, key_value_dim) - V-JEPA 2 features
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: Query vector from recursive reasoning (evolved across iterations)
+            key_value: V-JEPA 2 encoder features (spatial-temporal)
+
+        Returns:
+            pooled: (B, hidden_size) classification-ready representation
+        """
+        B, S, _ = key_value.shape
+
+        # Project query, key, value
+        q = self.q_proj(query)  # (B, 1, hidden_size)
+        k = self.k_proj(key_value)  # (B, S, hidden_size)
+        v = self.v_proj(key_value)  # (B, S, hidden_size)
+
+        # Reshape for multi-head attention
+        q = q.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, 1, D)
+        k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, S, D)
+        v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, S, D)
+
+        # Scaled dot-product attention
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, 1, S)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        # Aggregate
+        out = torch.matmul(attn, v)  # (B, H, 1, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, 1, self.hidden_size)
+        out = self.o_proj(out)
+
+        return out.squeeze(1)  # (B, hidden_size)

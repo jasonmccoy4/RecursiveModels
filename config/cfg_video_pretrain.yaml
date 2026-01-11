@@ -1,0 +1,46 @@
+# Something-Something V2 Video Classification Training Config
+# Uses V-JEPA 2 as frozen feature extractor with recursive classifier
+
+defaults:
+  - arch: trm_vjepa
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Data paths - Update these to your local SSv2 dataset location
+data_root: "C:\\Users\\Jason\\ai_data\\ssv2\\videos"
+train_annotations: "C:\\Users\\Jason\\ai_data\\ssv2\\train.json"
+val_annotations: "C:\\Users\\Jason\\ai_data\\ssv2\\validation.json"
+labels_path: "C:\\Users\\Jason\\ai_data\\ssv2\\labels.json"
+
+# V-JEPA 2 config
+vjepa_model_name: "facebook/vjepa2-vitl-fpc64-256"
+
+# Video config
+num_frames: 64  # V-JEPA 2 expects 64 frames
+frame_size: 256  # V-JEPA 2 crop size
+
+# Training hyperparams
+global_batch_size: 2  # Smaller than ARC due to video memory requirements
+epochs: 5
+eval_interval: 1  # Evaluate every 5 epochs
+checkpoint_every_eval: True
+
+# Learning rate schedule
+lr: 1e-4
+lr_min_ratio: 0.1
+lr_warmup_steps: 2000
+
+# Optimizer settings
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.05
+
+# Mixed precision for efficiency
+mixed_precision: True
+
+# Gradient accumulation (increase effective batch size)
+gradient_accumulation_steps: 384  # Effective batch
+
+seed: 42
