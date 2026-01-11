@@ -217,20 +217,22 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         """Project V-JEPA 2 features to hidden dimension."""
         return self.input_proj(vjepa_features)
 
-    def empty_carry(self, batch_size: int, seq_len: int) -> VJEPARecursiveCarry_Inner:
+    def empty_carry(self, batch_size: int, seq_len: int, device: torch.device = None) -> VJEPARecursiveCarry_Inner:
         """Create empty inner carry state."""
+        if device is None:
+            device = next(self.parameters()).device
         return VJEPARecursiveCarry_Inner(
             z_H=torch.empty(
                 batch_size, seq_len, self.config.hidden_size,
-                dtype=self.forward_dtype
+                dtype=self.forward_dtype, device=device
             ),
             z_L=torch.empty(
                 batch_size, seq_len, self.config.hidden_size,
-                dtype=self.forward_dtype
+                dtype=self.forward_dtype, device=device
             ),
             query=torch.empty(
                 batch_size, 1, self.config.hidden_size,
-                dtype=self.forward_dtype
+                dtype=self.forward_dtype, device=device
             ),
         )
 
@@ -339,11 +341,12 @@ class VJEPARecursiveClassifier_ACTV1(nn.Module):
         labels: torch.Tensor
     ) -> VJEPARecursiveCarry:
         """Create initial carry state for a batch."""
+        device = vjepa_features.device
         return VJEPARecursiveCarry(
-            inner_carry=self.inner.empty_carry(batch_size, seq_len),
+            inner_carry=self.inner.empty_carry(batch_size, seq_len, device=device),
 
-            steps=torch.zeros((batch_size,), dtype=torch.int32),
-            halted=torch.ones((batch_size,), dtype=torch.bool),  # Start halted, will be reset
+            steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size,), dtype=torch.bool, device=device),  # Start halted, will be reset
 
             vjepa_features=vjepa_features,
             labels=labels,
