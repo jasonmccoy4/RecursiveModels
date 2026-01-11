@@ -177,7 +177,9 @@ class SSV2Dataset(IterableDataset):
         self.local_batch_size = config.global_batch_size // config.num_replicas
 
         # Random state for reproducibility
-        self._rng = np.random.Generator(np.random.Philox(seed=config.seed + config.rank))
+        self._base_seed = config.seed + config.rank
+        self._epoch = 0
+        self._rng = np.random.Generator(np.random.Philox(seed=self._base_seed))
 
         # Set up augmentation pipeline
         if config.augment_config is not None:
@@ -188,6 +190,16 @@ class SSV2Dataset(IterableDataset):
                 get_default_train_augment_config() if self.is_train
                 else get_default_val_augment_config()
             )
+        self.augmentor = VideoAugmentor(self.augment_config, self._rng)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch for proper shuffling in distributed training.
+
+        Call this at the start of each epoch to ensure different shuffling.
+        """
+        self._epoch = epoch
+        # Reset RNG with epoch-dependent seed for different shuffling each epoch
+        self._rng = np.random.Generator(np.random.Philox(seed=self._base_seed + epoch * 1000))
         self.augmentor = VideoAugmentor(self.augment_config, self._rng)
 
     def _get_video_path(self, video_id: str) -> str:
@@ -246,13 +258,17 @@ class SSV2Dataset(IterableDataset):
 
     def _iter_train(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Training iterator with shuffling."""
-        # Get worker info for sharding
-        worker_info = torch.utils.data.get_worker_info()
-
         # Shuffle samples
         indices = self._rng.permutation(len(self.samples))
 
-        # Shard across workers if using multiple workers
+        # Shard across distributed ranks FIRST
+        rank = self.config.rank
+        num_replicas = self.config.num_replicas
+        if num_replicas > 1:
+            indices = indices[rank::num_replicas]
+
+        # Then shard across DataLoader workers within this rank
+        worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             indices = indices[worker_info.id::worker_info.num_workers]
 
@@ -283,13 +299,17 @@ class SSV2Dataset(IterableDataset):
 
     def _iter_test(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Test/validation iterator (no shuffling)."""
-        # Get worker info for sharding
-        worker_info = torch.utils.data.get_worker_info()
-
-        # Shard across workers if using multiple workers
+        # Shard across distributed ranks FIRST
+        rank = self.config.rank
+        num_replicas = self.config.num_replicas
         samples = self.samples
+        if num_replicas > 1:
+            samples = self.samples[rank::num_replicas]
+
+        # Then shard across DataLoader workers within this rank
+        worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
-            samples = self.samples[worker_info.id::worker_info.num_workers]
+            samples = samples[worker_info.id::worker_info.num_workers]
 
         batch_frames = []
         batch_labels = []

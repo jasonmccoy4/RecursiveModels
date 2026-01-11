@@ -43,4 +43,6 @@ mixed_precision: True
 # Gradient accumulation (increase effective batch size)
 gradient_accumulation_steps: 384  # Effective batch
 
+num_workers: 4
+
 seed: 42

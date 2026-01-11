@@ -18,6 +18,7 @@ Usage:
 from typing import Optional, Any, List
 from dataclasses import dataclass
 import os
+import sys
 import math
 
 import torch
@@ -90,6 +91,9 @@ class VideoPretrainConfig(pydantic.BaseModel):
     # Gradient accumulation
     gradient_accumulation_steps: int = 1
 
+    # DataLoader
+    num_workers: int = 4
+
     # Names and checkpointing
     project_name: Optional[str] = None
     run_name: Optional[str] = None
@@ -135,7 +139,8 @@ def create_video_dataloader(
     config: VideoPretrainConfig,
     split: str,
     rank: int,
-    world_size: int
+    world_size: int,
+    num_workers: int = 4
 ) -> tuple:
     """Create video dataloader for SSv2.
 
@@ -156,7 +161,7 @@ def create_video_dataloader(
         # augment_config=None uses appropriate defaults based on split
     )
 
-    return create_ssv2_dataloader(dataset_config, split, num_workers=4)
+    return create_ssv2_dataloader(dataset_config, split, num_workers=num_workers)
 
 
 def create_model(
@@ -428,7 +433,9 @@ def launch(hydra_config: DictConfig):
 
     # Initialize distributed training
     if "LOCAL_RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
+        # Use gloo on Windows (NCCL not supported), nccl on Linux
+        backend = "gloo" if sys.platform == "win32" else "nccl"
+        dist.init_process_group(backend=backend)
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -440,8 +447,8 @@ def launch(hydra_config: DictConfig):
     torch.random.manual_seed(config.seed + RANK)
 
     # Create dataloaders
-    train_loader, train_metadata = create_video_dataloader(config, "train", RANK, WORLD_SIZE)
-    val_loader, val_metadata = create_video_dataloader(config, "validation", RANK, WORLD_SIZE)
+    train_loader, train_metadata = create_video_dataloader(config, "train", RANK, WORLD_SIZE, config.num_workers)
+    val_loader, val_metadata = create_video_dataloader(config, "validation", RANK, WORLD_SIZE, config.num_workers)
 
     # Create V-JEPA 2 feature extractor (frozen)
     if RANK == 0:
@@ -493,6 +500,9 @@ def launch(hydra_config: DictConfig):
     for epoch in range(config.epochs):
         train_state.epoch = epoch
 
+        # Set epoch for proper shuffling in distributed training
+        train_loader.dataset.set_epoch(epoch)
+
         if RANK == 0:
             print(f"\n=== Epoch {epoch + 1}/{config.epochs} ===")
 
@@ -528,7 +538,8 @@ def launch(hydra_config: DictConfig):
     # Cleanup
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    if RANK == 0:
+        wandb.finish()
 
 
 if __name__ == "__main__":
