@@ -20,4 +20,5 @@ numba
 triton
 pyyaml
 transformers
-decord
+eva-decord
+torchcodec
