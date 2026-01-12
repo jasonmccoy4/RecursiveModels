@@ -238,3 +238,33 @@ class CrossAttentionPooler(nn.Module):
         out = self.o_proj(out)
 
         return out.squeeze(1)  # (B, hidden_size)
+
+    def get_attention_weights(
+        self,
+        query: torch.Tensor,      # (B, 1, query_dim)
+        key_value: torch.Tensor   # (B, S, key_value_dim)
+    ) -> torch.Tensor:
+        """
+        Compute attention weights without aggregating values.
+
+        Returns:
+            weights: (B, S) attention weights averaged across heads
+        """
+        B, S, _ = key_value.shape
+
+        # Project query and key
+        q = self.q_proj(query)  # (B, 1, hidden_size)
+        k = self.k_proj(key_value)  # (B, S, hidden_size)
+
+        # Reshape for multi-head attention
+        q = q.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, 1, D)
+        k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, S, D)
+
+        # Scaled dot-product attention weights
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, 1, S)
+        attn = F.softmax(attn, dim=-1)  # (B, H, 1, S)
+
+        # Average across heads and squeeze query dim
+        weights = attn.mean(dim=1).squeeze(1)  # (B, S)
+
+        return weights

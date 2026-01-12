@@ -146,13 +146,6 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
-        # Input projection: V-JEPA features -> hidden_size
-        # (V-JEPA is 1024, hidden is 1024, so this is identity-like but allows different dims)
-        self.input_proj = CastedLinear(
-            config.vjepa_hidden_size,
-            config.hidden_size,
-            bias=False
-        )
 
         # Learnable query token for cross-attention (replaces puzzle_emb)
         self.query_token = nn.Parameter(
@@ -212,10 +205,6 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
-
-    def _project_input(self, vjepa_features: torch.Tensor) -> torch.Tensor:
-        """Project V-JEPA 2 features to hidden dimension."""
-        return self.input_proj(vjepa_features)
 
     def empty_carry(self, batch_size: int, seq_len: int, device: torch.device = None) -> VJEPARecursiveCarry_Inner:
         """Create empty inner carry state."""
@@ -277,15 +266,16 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
-        # Project V-JEPA features
-        input_embeddings = self._project_input(vjepa_features)
-
         # Extract states
         z_H, z_L, query = carry.z_H, carry.z_L, carry.query
 
         # H_cycles-1 without grad (same pattern as TRM)
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
+                # Query-based input modulation: attention weights gate input per-position
+                attn_weights = self.cross_attention.get_attention_weights(query, vjepa_features)  # (B, S)
+                input_embeddings = vjepa_features * attn_weights.unsqueeze(-1)  # (B, S, D)
+
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
@@ -294,18 +284,20 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
                 query = query + self.query_update(z_H[:, 0:1])
 
         # Final iteration with gradients
+        # Query-based input modulation for final iteration
+        attn_weights = self.cross_attention.get_attention_weights(query, vjepa_features)  # (B, S)
+        input_embeddings = vjepa_features * attn_weights.unsqueeze(-1)  # (B, S, D)
+
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
-        # Final query update
+        # Final query update (maintained in carry for next ACT step)
         query = query + self.query_update(z_H[:, 0:1])
 
-        # Cross-attention pooling: query attends over V-JEPA features
-        pooled = self.cross_attention(query, vjepa_features)  # (B, hidden_size)
-
-        # Classification output
-        logits = self.classifier(pooled)  # (B, num_classes)
+        # Classification output - use first position of z_H directly
+        # (z_H[:, 0] has been informed by the full reasoning process)
+        logits = self.classifier(z_H[:, 0])  # (B, num_classes)
 
         # ACT Q-head (uses first position of z_H, same as TRM)
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)

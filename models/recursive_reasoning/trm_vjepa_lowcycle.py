@@ -145,13 +145,6 @@ class VJEPALowCycleClassifier_ACTV1_Inner(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
-        # Input projection: V-JEPA features -> hidden_size
-        self.input_proj = CastedLinear(
-            config.vjepa_hidden_size,
-            config.hidden_size,
-            bias=False
-        )
-
         # Learnable query token for cross-attention
         self.query_token = nn.Parameter(
             trunc_normal_init_(
@@ -210,10 +203,6 @@ class VJEPALowCycleClassifier_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
-
-    def _project_input(self, vjepa_features: torch.Tensor) -> torch.Tensor:
-        """Project V-JEPA 2 features to hidden dimension."""
-        return self.input_proj(vjepa_features)
 
     def empty_carry(self, batch_size: int, seq_len: int, device: torch.device = None) -> VJEPALowCycleCarry_Inner:
         """Create empty inner carry state."""
@@ -275,9 +264,6 @@ class VJEPALowCycleClassifier_ACTV1_Inner(nn.Module):
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
-        # Project V-JEPA features
-        input_embeddings = self._project_input(vjepa_features)
-
         # Extract states
         z_H, z_L, query = carry.z_H, carry.z_L, carry.query
 
@@ -285,6 +271,10 @@ class VJEPALowCycleClassifier_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
                 for _L_step in range(self.config.L_cycles):
+                    # Query-based input modulation: update every L_cycle
+                    attn_weights = self.cross_attention.get_attention_weights(query, vjepa_features)  # (B, S)
+                    input_embeddings = vjepa_features * attn_weights.unsqueeze(-1)  # (B, S, D)
+
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                     # Update query at each L_cycle using z_L
                     query = query + self.query_update(z_L[:, 0:1])
@@ -292,16 +282,17 @@ class VJEPALowCycleClassifier_ACTV1_Inner(nn.Module):
 
         # Final H iteration with gradients
         for _L_step in range(self.config.L_cycles):
+            # Query-based input modulation: update every L_cycle
+            attn_weights = self.cross_attention.get_attention_weights(query, vjepa_features)  # (B, S)
+            input_embeddings = vjepa_features * attn_weights.unsqueeze(-1)  # (B, S, D)
+
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
             # Update query at each L_cycle using z_L
             query = query + self.query_update(z_L[:, 0:1])
         z_H = self.L_level(z_H, z_L, **seq_info)
 
-        # Cross-attention pooling: query attends over V-JEPA features
-        pooled = self.cross_attention(query, vjepa_features)  # (B, hidden_size)
-
-        # Classification output
-        logits = self.classifier(pooled)  # (B, num_classes)
+        # Classification output - use first position of z_H directly
+        logits = self.classifier(z_H[:, 0])  # (B, num_classes)
 
         # ACT Q-head (uses first position of z_H)
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
