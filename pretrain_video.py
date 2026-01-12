@@ -379,6 +379,9 @@ def evaluate(
 
     # Aggregate across ranks
     if world_size > 1:
+        # Barrier to ensure all ranks have finished processing their batches
+        # (different ranks may have different batch counts due to uneven data sharding)
+        dist.barrier()
         stats = torch.tensor([total_correct, total_samples, total_loss, total_steps], device="cuda")
         dist.reduce(stats, dst=0)
         total_correct, total_samples, total_loss, total_steps = stats.tolist()
