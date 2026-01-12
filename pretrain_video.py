@@ -522,6 +522,9 @@ def launch(hydra_config: DictConfig):
 
         # Evaluate
         if (epoch + 1) % config.eval_interval == 0:
+            # Barrier to ensure all ranks finish training before eval
+            if WORLD_SIZE > 1:
+                dist.barrier()
             if RANK == 0:
                 print("Running evaluation...")
             metrics = evaluate(config, train_state, val_loader, RANK, WORLD_SIZE)

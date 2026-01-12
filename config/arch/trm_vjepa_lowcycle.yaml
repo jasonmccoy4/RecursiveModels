@@ -1,0 +1,40 @@
+# V-JEPA 2 Recursive Video Classifier Configuration (Low-Cycle Query Variant)
+# Updates query vector every L_cycle instead of every H_cycle for more frequent refinement
+
+name: recursive_reasoning.trm_vjepa_lowcycle@VJEPALowCycleClassifier_ACTV1
+loss:
+  name: losses@VideoClassificationACTLossHead
+  label_smoothing: 0.1
+  q_loss_weight: 0.5
+
+# V-JEPA 2 config
+vjepa_hidden_size: 1024  # V-JEPA 2 ViT-L output dimension
+
+# Recursive model config (adapted from TRM)
+hidden_size: 1024  # Match V-JEPA 2 dimension
+num_heads: 16  # 1024 / 64 = 16 heads
+expansion: 4.0
+
+# Recursive structure
+H_cycles: 3  # Outer loops (2 no-grad + 1 with grad)
+L_cycles: 6  # Inner loops per H step
+L_layers: 2  # Transformer blocks in L-level
+
+# ACT (Adaptive Computation Time) config
+halt_max_steps: 8  # Max ACT iterations
+halt_exploration_prob: 0.1  # Exploration rate for Q-learning
+no_ACT_continue: True  # Use simple sigmoid halt (no Q-continue)
+
+# Cross-attention pooling config
+cross_attn_heads: 8  # Heads for query-to-VJEPA attention
+
+# Classification config
+num_classes: 174  # Something-Something V2 classes
+
+# Positional encodings
+pos_encodings: rope
+rope_theta: 10000.0
+
+# Precision
+forward_dtype: bfloat16
+rms_norm_eps: 1.0e-5
