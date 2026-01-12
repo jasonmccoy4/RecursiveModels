@@ -262,11 +262,20 @@ class SSV2Dataset(IterableDataset):
         epoch_rng = np.random.Generator(np.random.Philox(seed=self._base_seed + self._epoch * 1000))
         indices = epoch_rng.permutation(len(self.samples))
 
-        # Shard across distributed ranks FIRST
+        # Shard across distributed ranks with padding to ensure equal batch counts
+        # This is critical for NCCL collective operations to avoid deadlocks
         rank = self.config.rank
         num_replicas = self.config.num_replicas
         if num_replicas > 1:
-            indices = indices[rank::num_replicas]
+            # Calculate samples per rank with padding (like DistributedSampler)
+            total_samples = len(indices)
+            samples_per_rank = (total_samples + num_replicas - 1) // num_replicas
+            # Pad indices by repeating from the start
+            padding_size = samples_per_rank * num_replicas - total_samples
+            if padding_size > 0:
+                indices = np.concatenate([indices, indices[:padding_size]])
+            # Now shard evenly
+            indices = indices[rank * samples_per_rank:(rank + 1) * samples_per_rank]
 
         # Then shard across DataLoader workers within this rank
         worker_info = torch.utils.data.get_worker_info()
@@ -300,12 +309,20 @@ class SSV2Dataset(IterableDataset):
 
     def _iter_test(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Test/validation iterator (no shuffling)."""
-        # Shard across distributed ranks FIRST
+        # Shard across distributed ranks with padding to ensure equal batch counts
         rank = self.config.rank
         num_replicas = self.config.num_replicas
-        samples = self.samples
+        samples = list(self.samples)  # Make a copy
         if num_replicas > 1:
-            samples = self.samples[rank::num_replicas]
+            # Calculate samples per rank with padding (like DistributedSampler)
+            total_samples = len(samples)
+            samples_per_rank = (total_samples + num_replicas - 1) // num_replicas
+            # Pad samples by repeating from the start
+            padding_size = samples_per_rank * num_replicas - total_samples
+            if padding_size > 0:
+                samples = samples + samples[:padding_size]
+            # Now shard evenly
+            samples = samples[rank * samples_per_rank:(rank + 1) * samples_per_rank]
 
         # Then shard across DataLoader workers within this rank
         worker_info = torch.utils.data.get_worker_info()
