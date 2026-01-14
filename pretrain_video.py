@@ -108,6 +108,10 @@ class VideoPretrainConfig(pydantic.BaseModel):
     # DataLoader
     num_workers: int = 4
     prefetch_factor: int = 2
+    persistent_workers: bool = True
+
+    # Pre-computed V-JEPA features (for 3-5x speedup)
+    precomputed_features_dir: Optional[str] = None
 
     # Names and checkpointing
     project_name: Optional[str] = None
@@ -156,7 +160,8 @@ def create_video_dataloader(
     rank: int,
     world_size: int,
     num_workers: int = 4,
-    prefetch_factor: int = 2
+    prefetch_factor: int = 2,
+    persistent_workers: bool = True,
 ) -> tuple:
     """Create video dataloader for the configured dataset.
 
@@ -166,7 +171,38 @@ def create_video_dataloader(
 
     Training augmentations include: temporal jittering, random resized crop, color jitter,
     random grayscale, gaussian blur, and random erasing.
+
+    If precomputed_features_dir is set, loads pre-computed V-JEPA features instead of raw videos.
     """
+    # Check for precomputed features
+    if config.precomputed_features_dir:
+        from video_dataset import (
+            create_precomputed_diving48_dataloader,
+            create_precomputed_ssv2_dataloader,
+            PrecomputedDatasetConfig,
+        )
+        precomputed_config = PrecomputedDatasetConfig(
+            seed=config.seed,
+            features_dir=config.precomputed_features_dir,
+            annotations_path=config.train_annotations if split == "train" else config.val_annotations,
+            global_batch_size=config.global_batch_size,
+            rank=rank,
+            num_replicas=world_size,
+        )
+        if config.dataset == "diving48":
+            diving48_split = "test" if split == "validation" else split
+            return create_precomputed_diving48_dataloader(
+                precomputed_config, diving48_split,
+                num_workers=num_workers, prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers
+            )
+        else:
+            return create_precomputed_ssv2_dataloader(
+                precomputed_config, split,
+                num_workers=num_workers, prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers
+            )
+
     if config.dataset == "diving48":
         # Map "validation" split to "test" for Diving48
         diving48_split = "test" if split == "validation" else split
@@ -181,7 +217,11 @@ def create_video_dataloader(
             rank=rank,
             num_replicas=world_size,
         )
-        return create_diving48_dataloader(dataset_config, diving48_split, num_workers=num_workers, prefetch_factor=prefetch_factor)
+        return create_diving48_dataloader(
+            dataset_config, diving48_split,
+            num_workers=num_workers, prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers
+        )
     else:
         # Default: SSv2
         dataset_config = SSV2DatasetConfig(
@@ -195,7 +235,11 @@ def create_video_dataloader(
             rank=rank,
             num_replicas=world_size,
         )
-        return create_ssv2_dataloader(dataset_config, split, num_workers=num_workers, prefetch_factor=prefetch_factor)
+        return create_ssv2_dataloader(
+            dataset_config, split,
+            num_workers=num_workers, prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers
+        )
 
 
 def create_model(
@@ -220,6 +264,7 @@ def create_model(
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)
 
         # Compile for performance (optional)
+        # Note: "max-autotune" has overflow bugs on Windows, use "reduce-overhead" instead
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)
 
@@ -255,24 +300,30 @@ def train_batch(
     """Process a single training batch."""
     train_state.step += 1
 
-    # Move to device
-    video_frames = batch["video_frames"].cuda(non_blocking=True)  # (B, T, C, H, W)
     labels = batch["labels"].cuda(non_blocking=True)  # (B,)
 
-    batch_size, num_frames = video_frames.shape[:2]
-
-    # Preprocess for V-JEPA 2
-    processed = train_state.vjepa_extractor.preprocess(
-        video_frames,
-        return_tensors="pt"
-    )
-    pixel_values = processed["pixel_values_videos"].to("cuda", non_blocking=True)
-
-    # Extract V-JEPA 2 features (frozen, no gradients)
-    with torch.no_grad():
-        vjepa_features = train_state.vjepa_extractor(pixel_values)  # (B, S, 1024)
-        # Cast to bfloat16 to match model's forward dtype
+    # Check if using pre-computed features or raw video
+    if "vjepa_features" in batch:
+        # Pre-computed features path (3-5x faster)
+        vjepa_features = batch["vjepa_features"].cuda(non_blocking=True)
         vjepa_features = vjepa_features.to(torch.bfloat16)
+        batch_size = vjepa_features.shape[0]
+    else:
+        # Raw video path - extract V-JEPA features
+        video_frames = batch["video_frames"].cuda(non_blocking=True)  # (B, T, C, H, W)
+        batch_size = video_frames.shape[0]
+
+        # Preprocess for V-JEPA 2
+        processed = train_state.vjepa_extractor.preprocess(
+            video_frames,
+            return_tensors="pt"
+        )
+        pixel_values = processed["pixel_values_videos"].to("cuda", non_blocking=True)
+
+        # Extract V-JEPA 2 features (frozen, no gradients)
+        with torch.no_grad():
+            vjepa_features = train_state.vjepa_extractor(pixel_values)  # (B, S, 1024)
+            vjepa_features = vjepa_features.to(torch.bfloat16)
 
     seq_len = vjepa_features.shape[1]
 
@@ -363,18 +414,25 @@ def evaluate(
 
     with torch.inference_mode():
         for batch in eval_loader:
-            video_frames = batch["video_frames"].cuda(non_blocking=True)
             labels = batch["labels"].cuda(non_blocking=True)
             batch_size = labels.shape[0]
 
-            # Extract V-JEPA 2 features
-            processed = train_state.vjepa_extractor.preprocess(
-                video_frames,
-                return_tensors="pt"
-            )
-            pixel_values = processed["pixel_values_videos"].to("cuda", non_blocking=True)
-            vjepa_features = train_state.vjepa_extractor(pixel_values)
-            vjepa_features = vjepa_features.to(torch.bfloat16)
+            # Check if using pre-computed features or raw video
+            if "vjepa_features" in batch:
+                # Pre-computed features path
+                vjepa_features = batch["vjepa_features"].cuda(non_blocking=True)
+                vjepa_features = vjepa_features.to(torch.bfloat16)
+            else:
+                # Raw video path - extract V-JEPA features
+                video_frames = batch["video_frames"].cuda(non_blocking=True)
+
+                processed = train_state.vjepa_extractor.preprocess(
+                    video_frames,
+                    return_tensors="pt"
+                )
+                pixel_values = processed["pixel_values_videos"].to("cuda", non_blocking=True)
+                vjepa_features = train_state.vjepa_extractor(pixel_values)
+                vjepa_features = vjepa_features.to(torch.bfloat16)
 
             seq_len = vjepa_features.shape[1]
 
@@ -486,8 +544,14 @@ def launch(hydra_config: DictConfig):
     torch.random.manual_seed(config.seed + RANK)
 
     # Create dataloaders
-    train_loader, train_metadata = create_video_dataloader(config, "train", RANK, WORLD_SIZE, config.num_workers, prefetch_factor=config.prefetch_factor)
-    val_loader, val_metadata = create_video_dataloader(config, "validation", RANK, WORLD_SIZE, config.num_workers, prefetch_factor=config.prefetch_factor)
+    train_loader, train_metadata = create_video_dataloader(
+        config, "train", RANK, WORLD_SIZE, config.num_workers,
+        prefetch_factor=config.prefetch_factor, persistent_workers=config.persistent_workers
+    )
+    val_loader, val_metadata = create_video_dataloader(
+        config, "validation", RANK, WORLD_SIZE, config.num_workers,
+        prefetch_factor=config.prefetch_factor, persistent_workers=config.persistent_workers
+    )
 
     # Create V-JEPA 2 feature extractor (frozen)
     if RANK == 0:

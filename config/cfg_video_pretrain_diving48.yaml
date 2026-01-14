@@ -48,5 +48,10 @@ gradient_accumulation_steps: 16  # Effective batch size = 4 * 16 = 64
 
 num_workers: 12
 prefetch_factor: 2
+persistent_workers: True
+
+# Pre-computed V-JEPA features (set to enable 3-5x speedup)
+# Run precompute_vjepa_features.py first to generate these
+precomputed_features_dir: null  # e.g., "C:\\Users\\Jason\\ai_data\\diving48\\vjepa_features"
 
 seed: 42

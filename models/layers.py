@@ -4,11 +4,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-#try:
-#    from flash_attn_interface import flash_attn_func  # type: ignore[import]
-#except ImportError:
-#    # Fallback to FlashAttention 2
-#    from flash_attn import flash_attn_func  # type: ignore[import]
+try:
+    from flash_attn import flash_attn_func  # type: ignore[import]
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
 from torch.nn.functional import scaled_dot_product_attention
 
 from models.common import trunc_normal_init_
@@ -185,10 +185,15 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
-        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
-        attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
-        attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
+        # Use flash_attn if available, otherwise fall back to SDPA
+        if HAS_FLASH_ATTN:
+            # flash_attn_func expects (B, S, H, D) format - already in that format
+            attn_output = flash_attn_func(query, key, value, causal=self.causal)
+        else:
+            # scaled_dot_product_attention expects (B, H, S, D) format
+            query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value))
+            attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
+            attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
         attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
