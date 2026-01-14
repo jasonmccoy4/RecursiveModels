@@ -1,14 +1,23 @@
 """
 V-JEPA 2 Recursive Video Classifier Training Script
 
-Trains the recursive video classifier on Something-Something V2 dataset
+Trains the recursive video classifier on video classification datasets
 using V-JEPA 2 as a frozen feature extractor.
 
+Supported datasets:
+- Something-Something V2 (ssv2): 174 classes, direction-sensitive actions
+- Diving48: 48 fine-grained diving action classes
+
 Usage:
+    # SSv2 (default):
     python pretrain_video.py arch=trm_vjepa
+
+    # Diving48:
+    python pretrain_video.py --config-name=cfg_video_pretrain_diving48 arch=trm_vjepa_diving48
 
     # With custom data paths:
     python pretrain_video.py arch=trm_vjepa \
+        dataset=ssv2 \
         data_root=path/to/ssv2/videos \
         train_annotations=path/to/train.json \
         val_annotations=path/to/validation.json \
@@ -36,7 +45,9 @@ from adam_atan2_pytorch import AdamAtan2
 
 from video_dataset import (
     SSV2DatasetConfig, SSV2DatasetMetadata,
-    create_ssv2_dataloader, create_ssv2_config
+    create_ssv2_dataloader, create_ssv2_config,
+    Diving48DatasetConfig, Diving48DatasetMetadata,
+    create_diving48_dataloader, create_diving48_config,
 )
 from models.vjepa_extractor import VJEPA2FeatureExtractor, create_vjepa_extractor
 from utils.functions import load_model_class
@@ -59,6 +70,9 @@ class VideoPretrainConfig(pydantic.BaseModel):
 
     # Model architecture
     arch: ArchConfig
+
+    # Dataset selection: "ssv2" or "diving48"
+    dataset: str = "ssv2"
 
     # Data paths
     data_root: str = "data/ssv2/videos"
@@ -142,26 +156,44 @@ def create_video_dataloader(
     world_size: int,
     num_workers: int = 4
 ) -> tuple:
-    """Create video dataloader for SSv2.
+    """Create video dataloader for the configured dataset.
 
-    Uses SSv2-optimized augmentations (no horizontal flip due to direction-sensitive labels).
+    Supports:
+    - SSv2: Uses optimized augmentations (no horizontal flip due to direction-sensitive labels)
+    - Diving48: Fine-grained diving actions (allows horizontal flip)
+
     Training augmentations include: temporal jittering, random resized crop, color jitter,
     random grayscale, gaussian blur, and random erasing.
     """
-    dataset_config = SSV2DatasetConfig(
-        seed=config.seed,
-        data_root=config.data_root,
-        annotations_path=config.train_annotations if split == "train" else config.val_annotations,
-        labels_path=config.labels_path,
-        num_frames=config.num_frames,
-        frame_size=config.frame_size,
-        global_batch_size=config.global_batch_size,
-        rank=rank,
-        num_replicas=world_size,
-        # augment_config=None uses appropriate defaults based on split
-    )
-
-    return create_ssv2_dataloader(dataset_config, split, num_workers=num_workers)
+    if config.dataset == "diving48":
+        # Map "validation" split to "test" for Diving48
+        diving48_split = "test" if split == "validation" else split
+        dataset_config = Diving48DatasetConfig(
+            seed=config.seed,
+            data_root=config.data_root,
+            annotations_path=config.train_annotations if split == "train" else config.val_annotations,
+            labels_path=config.labels_path if config.labels_path else None,
+            num_frames=config.num_frames,
+            frame_size=config.frame_size,
+            global_batch_size=config.global_batch_size,
+            rank=rank,
+            num_replicas=world_size,
+        )
+        return create_diving48_dataloader(dataset_config, diving48_split, num_workers=num_workers)
+    else:
+        # Default: SSv2
+        dataset_config = SSV2DatasetConfig(
+            seed=config.seed,
+            data_root=config.data_root,
+            annotations_path=config.train_annotations if split == "train" else config.val_annotations,
+            labels_path=config.labels_path,
+            num_frames=config.num_frames,
+            frame_size=config.frame_size,
+            global_batch_size=config.global_batch_size,
+            rank=rank,
+            num_replicas=world_size,
+        )
+        return create_ssv2_dataloader(dataset_config, split, num_workers=num_workers)
 
 
 def create_model(
@@ -204,7 +236,7 @@ def create_model(
     # Create optimizer
     optimizer = AdamAtan2(
         model.parameters(),
-        lr=0.00005,  # Set by scheduler
+        lr=config.lr,
         weight_decay=config.weight_decay,
         betas=(config.beta1, config.beta2)
     )
@@ -413,11 +445,12 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     if rank == 0:
         config = VideoPretrainConfig(**hydra_config)
 
-        # Auto-generate names
+        # Auto-generate names based on dataset
+        dataset_name = config.dataset.upper()
         if config.project_name is None:
-            config.project_name = "SSv2-VJEPA-RecursiveClassifier"
+            config.project_name = f"{dataset_name}-VJEPA-RecursiveClassifier"
         if config.run_name is None:
-            config.run_name = f"vjepa-recursive-{coolname.generate_slug(2)}"
+            config.run_name = f"vjepa-{config.dataset}-{coolname.generate_slug(2)}"
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
 
@@ -429,7 +462,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     return objects[0]
 
 
-@hydra.main(config_path="config", config_name="cfg_video_pretrain", version_base=None)
+@hydra.main(config_path="config", config_name="cfg_video_pretrain_diving48", version_base=None)
 def launch(hydra_config: DictConfig):
     """Main training entry point."""
     RANK = 0

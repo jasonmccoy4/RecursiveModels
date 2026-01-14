@@ -11,7 +11,10 @@
             "request": "launch",
             "program": ".\\pretrain_video.py",
             "console": "integratedTerminal",
-            "args": "arch=trm_vjepa"
+            "args": ["arch=trm_vjepa_diving48"],
+            "env": {
+                "DISABLE_COMPILE": "1"
+            }
         }
     ]
 }

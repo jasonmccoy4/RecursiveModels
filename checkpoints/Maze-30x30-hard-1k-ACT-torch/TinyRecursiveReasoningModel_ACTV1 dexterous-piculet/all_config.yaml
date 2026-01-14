@@ -1,0 +1,48 @@
+arch:
+  H_cycles: 3
+  H_layers: 0
+  L_cycles: 6
+  L_layers: 2
+  expansion: 4
+  forward_dtype: bfloat16
+  halt_exploration_prob: 0.1
+  halt_max_steps: 16
+  hidden_size: 512
+  loss:
+    loss_type: stablemax_cross_entropy
+    name: losses@ACTLossHead
+  mlp_t: false
+  name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+  no_ACT_continue: true
+  num_heads: 8
+  pos_encodings: rope
+  puzzle_emb_len: 16
+  puzzle_emb_ndim: 512
+beta1: 0.9
+beta2: 0.95
+checkpoint_every_eval: true
+checkpoint_path: checkpoints\Maze-30x30-hard-1k-ACT-torch\TinyRecursiveReasoningModel_ACTV1
+  dexterous-piculet
+data_paths:
+- .\data\maze-30x30-hard-1k
+data_paths_test: []
+ema: false
+ema_rate: 0.999
+epochs: 50000
+eval_interval: 5000
+eval_save_outputs: []
+evaluators:
+- name: arc@ARC
+freeze_weights: false
+global_batch_size: 64
+load_checkpoint: null
+lr: 1.0e-05
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+min_eval_interval: 0
+project_name: Maze-30x30-hard-1k-ACT-torch
+puzzle_emb_lr: 0.01
+puzzle_emb_weight_decay: 0.1
+run_name: TinyRecursiveReasoningModel_ACTV1 dexterous-piculet
+seed: 0
+weight_decay: 0.1

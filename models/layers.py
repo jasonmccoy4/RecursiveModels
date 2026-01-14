@@ -96,6 +96,64 @@ class RotaryEmbedding(nn.Module):
         return self.cos_cached, self.sin_cached
 
 
+class RotaryEmbedding3D(nn.Module):
+    """
+    3D Factorized Rotary Position Embedding for video (T, H, W).
+
+    Splits head_dim into 3 parts and applies separate rotations for each dimension.
+    This preserves spatial-temporal structure for video transformers.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        grid_size: Tuple[int, int, int],
+        base: float = 10000.0,
+        device=None
+    ):
+        super().__init__()
+        self.dim = dim
+        self.grid_size = grid_size  # (T, H, W)
+
+        # Split head_dim into 3 parts (must be even for rotate_half)
+        # Ensure each part is even by rounding down to nearest even
+        dim_t = (dim // 3) // 2 * 2
+        dim_h = (dim // 3) // 2 * 2
+        dim_w = dim - dim_t - dim_h
+
+        T, H, W = grid_size
+        t_pos = torch.arange(T, dtype=torch.float32, device=device)
+        h_pos = torch.arange(H, dtype=torch.float32, device=device)
+        w_pos = torch.arange(W, dtype=torch.float32, device=device)
+
+        # Create 1D RoPE embeddings for each dimension
+        # Standard RoPE: inv_freq -> freqs -> cat([freqs, freqs])
+        def make_1d_emb(positions, dim_part):
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim_part, 2, dtype=torch.float32, device=device) / dim_part))
+            freqs = torch.outer(positions, inv_freq)  # (positions, dim_part/2)
+            return torch.cat([freqs, freqs], dim=-1)  # (positions, dim_part)
+
+        emb_t = make_1d_emb(t_pos, dim_t)  # (T, dim_t)
+        emb_h = make_1d_emb(h_pos, dim_h)  # (H, dim_h)
+        emb_w = make_1d_emb(w_pos, dim_w)  # (W, dim_w)
+
+        # Expand to full grid and concatenate
+        emb_t = emb_t.view(T, 1, 1, dim_t).expand(T, H, W, dim_t)
+        emb_h = emb_h.view(1, H, 1, dim_h).expand(T, H, W, dim_h)
+        emb_w = emb_w.view(1, 1, W, dim_w).expand(T, H, W, dim_w)
+
+        emb = torch.cat([emb_t, emb_h, emb_w], dim=-1)  # (T, H, W, dim)
+
+        # Flatten to sequence: (T*H*W, dim)
+        emb = emb.reshape(-1, dim)
+
+        self.cos_cached = nn.Buffer(emb.cos(), persistent=False)
+        self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
+
+    def forward(self):
+        return self.cos_cached, self.sin_cached
+
+
 class Attention(nn.Module):
     def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
         super().__init__()

@@ -7,13 +7,13 @@ using V-JEPA 2 as a frozen feature extractor. Key changes from original TRM:
 1. Input: V-JEPA 2 features (1024-dim) instead of token embeddings
 2. Hidden size: 1024 (matched to V-JEPA 2)
 3. Output: Classification head (174 classes) instead of LM head
-4. Pooling: Cross-attention over V-JEPA 2 features using evolved query vector
+4. Pooling: Mean pooling over full V-JEPA sequence for classification
 5. ACT: Retained for adaptive computation
+6. Position encoding: 3D-RoPE for spatial-temporal structure (T, H, W)
 """
 
 from typing import Tuple, Dict
 from dataclasses import dataclass
-import math
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -21,9 +21,10 @@ from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
 from models.layers import (
-    rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin,
-    CastedLinear, CrossAttentionPooler
+    rms_norm, SwiGLU, Attention, RotaryEmbedding3D, CosSin,
+    CastedLinear
 )
+from diving48_labels import get_component_counts
 
 
 @dataclass
@@ -31,7 +32,6 @@ class VJEPARecursiveCarry_Inner:
     """Inner carry state for recursive reasoning."""
     z_H: torch.Tensor  # High-level reasoning state: (B, S, D)
     z_L: torch.Tensor  # Low-level reasoning state: (B, S, D)
-    query: torch.Tensor  # Evolved query vector: (B, 1, D)
 
 
 @dataclass
@@ -75,8 +75,11 @@ class VJEPARecursiveConfig(BaseModel):
     # Classification config
     num_classes: int = 174  # Something-Something V2
 
-    # Cross-attention config
+    # Cross-attention config (legacy, unused)
     cross_attn_heads: int = 8
+
+    # 3D-RoPE config for V-JEPA spatial-temporal structure
+    grid_size: Tuple[int, int, int] = (32, 16, 16)  # (T, H, W) for V-JEPA 2
 
     forward_dtype: str = "bfloat16"
 
@@ -146,23 +149,11 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
-
-        # Learnable query token for cross-attention (replaces puzzle_emb)
-        self.query_token = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty(1, 1, config.hidden_size, dtype=self.forward_dtype),
-                std=1.0 / math.sqrt(config.hidden_size)
-            )
-        )
-
-        # Query update projection (updates query based on z_H)
-        self.query_update = CastedLinear(config.hidden_size, config.hidden_size, bias=False)
-
-        # Position encodings for video features
+        # 3D Position encodings for video features (T, H, W structure)
         if config.pos_encodings == "rope":
-            self.rotary_emb = RotaryEmbedding(
+            self.rotary_emb = RotaryEmbedding3D(
                 dim=config.hidden_size // config.num_heads,
-                max_position_embeddings=8192,  # Large enough for V-JEPA sequences
+                grid_size=config.grid_size,  # (T, H, W) = (32, 16, 16) for V-JEPA 2
                 base=config.rope_theta
             )
 
@@ -185,14 +176,6 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
                 std=1
             ),
             persistent=True
-        )
-
-        # Cross-attention pooling module
-        self.cross_attention = CrossAttentionPooler(
-            query_dim=config.hidden_size,
-            key_value_dim=config.vjepa_hidden_size,
-            num_heads=config.cross_attn_heads,
-            hidden_size=config.hidden_size
         )
 
         # Classification head (replaces lm_head)
@@ -219,10 +202,6 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
                 batch_size, seq_len, self.config.hidden_size,
                 dtype=self.forward_dtype, device=device
             ),
-            query=torch.empty(
-                batch_size, 1, self.config.hidden_size,
-                dtype=self.forward_dtype, device=device
-            ),
         )
 
     def reset_carry(
@@ -237,12 +216,10 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         # Expand init states to sequence length
         H_init_expanded = self.H_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
         L_init_expanded = self.L_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
-        query_init = self.query_token.expand(batch_size, -1, -1)
 
         return VJEPARecursiveCarry_Inner(
             z_H=torch.where(reset_flag.view(-1, 1, 1), H_init_expanded, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), L_init_expanded, carry.z_L),
-            query=torch.where(reset_flag.view(-1, 1, 1), query_init, carry.query),
         )
 
     def forward(
@@ -254,7 +231,7 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         Forward pass through recursive reasoning.
 
         Args:
-            carry: Inner carry state (z_H, z_L, query)
+            carry: Inner carry state (z_H, z_L)
             vjepa_features: V-JEPA 2 encoder features (B, S, 1024)
 
         Returns:
@@ -267,46 +244,34 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         )
 
         # Extract states
-        z_H, z_L, query = carry.z_H, carry.z_L, carry.query
+        z_H, z_L = carry.z_H, carry.z_L
+
+        # Direct input injection (like trm.py)
+        input_embeddings = vjepa_features
 
         # H_cycles-1 without grad (same pattern as TRM)
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
-                # Query-based input modulation: attention weights gate input per-position
-                attn_weights = self.cross_attention.get_attention_weights(query, vjepa_features)  # (B, S)
-                input_embeddings = vjepa_features * attn_weights.unsqueeze(-1)  # (B, S, D)
-
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
 
-                # Update query based on first position of z_H
-                query = query + self.query_update(z_H[:, 0:1])
-
         # Final iteration with gradients
-        # Query-based input modulation for final iteration
-        attn_weights = self.cross_attention.get_attention_weights(query, vjepa_features)  # (B, S)
-        input_embeddings = vjepa_features * attn_weights.unsqueeze(-1)  # (B, S, D)
-
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
-        # Final query update (maintained in carry for next ACT step)
-        query = query + self.query_update(z_H[:, 0:1])
+        # Mean pooling for classification (aggregate all spatial-temporal info)
+        pooled = z_H.mean(dim=1)  # (B, D)
+        logits = self.classifier(pooled)  # (B, num_classes)
 
-        # Classification output - use first position of z_H directly
-        # (z_H[:, 0] has been informed by the full reasoning process)
-        logits = self.classifier(z_H[:, 0])  # (B, num_classes)
-
-        # ACT Q-head (uses first position of z_H, same as TRM)
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        # ACT Q-head
+        q_logits = self.q_head(pooled).to(torch.float32)
 
         # New carry (detached)
         new_carry = VJEPARecursiveCarry_Inner(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
-            query=query.detach()
         )
 
         return new_carry, logits, (q_logits[..., 0], q_logits[..., 1])
@@ -408,6 +373,205 @@ class VJEPARecursiveClassifier_ACTV1(nn.Module):
                     halted = halted | (q_halt_logits > q_continue_logits)
 
                 # Exploration: randomly force more steps
+                min_halt_steps = (
+                    (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) *
+                    torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                )
+                halted = halted & (new_steps >= min_halt_steps)
+
+        new_carry = VJEPARecursiveCarry(
+            inner_carry=new_inner_carry,
+            steps=new_steps,
+            halted=halted,
+            vjepa_features=new_vjepa_features,
+            labels=new_labels,
+        )
+
+        return new_carry, outputs
+
+
+class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_Inner):
+    """
+    Multi-head variant for Diving48 classification.
+
+    Outputs separate logits for each component:
+    - Position (6 classes)
+    - Somersault count (determined from vocab)
+    - Twist count (determined from vocab)
+    - Body position (4 classes)
+    """
+
+    def __init__(self, config: VJEPARecursiveConfig) -> None:
+        # Initialize parent but we'll replace the classifier
+        super().__init__(config)
+
+        # Get component counts
+        components = get_component_counts()
+
+        # Replace single classifier with multi-head classifiers
+        del self.classifier
+
+        self.position_head = CastedLinear(config.hidden_size, components.num_positions, bias=True)
+        self.somersault_head = CastedLinear(config.hidden_size, components.num_somersaults, bias=True)
+        self.twist_head = CastedLinear(config.hidden_size, components.num_twists, bias=True)
+        self.body_head = CastedLinear(config.hidden_size, components.num_body_positions, bias=True)
+
+        # Store component counts
+        self.num_positions = components.num_positions
+        self.num_somersaults = components.num_somersaults
+        self.num_twists = components.num_twists
+        self.num_body_positions = components.num_body_positions
+
+    def forward(
+        self,
+        carry: VJEPARecursiveCarry_Inner,
+        vjepa_features: torch.Tensor
+    ) -> Tuple[VJEPARecursiveCarry_Inner, Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass with multi-head output.
+
+        Returns:
+            new_carry: Updated carry state
+            logits_dict: Dict with position/somersault/twist/body logits
+            (q_halt, q_continue): ACT Q-values
+        """
+        seq_info = dict(
+            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+        )
+
+        z_H, z_L = carry.z_H, carry.z_L
+
+        # Direct input injection (like trm.py)
+        input_embeddings = vjepa_features
+
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _H_step in range(self.config.H_cycles - 1):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                z_H = self.L_level(z_H, z_L, **seq_info)
+
+        # Final iteration with gradients
+        for _L_step in range(self.config.L_cycles):
+            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        z_H = self.L_level(z_H, z_L, **seq_info)
+
+        # Mean pooling for multi-head classification
+        hidden = z_H.mean(dim=1)  # (B, D)
+        position_logits = self.position_head(hidden)
+        somersault_logits = self.somersault_head(hidden)
+        twist_logits = self.twist_head(hidden)
+        body_logits = self.body_head(hidden)
+
+        # ACT Q-head
+        q_logits = self.q_head(hidden).to(torch.float32)
+
+        new_carry = VJEPARecursiveCarry_Inner(
+            z_H=z_H.detach(),
+            z_L=z_L.detach(),
+        )
+
+        return new_carry, {
+            "position_logits": position_logits,
+            "somersault_logits": somersault_logits,
+            "twist_logits": twist_logits,
+            "body_logits": body_logits,
+        }, (q_logits[..., 0], q_logits[..., 1])
+
+
+class VJEPARecursiveClassifier_MultiHead(nn.Module):
+    """
+    ACT wrapper for multi-head Diving48 classifier.
+
+    Supports both multi-head and single-head modes via head_type config.
+    """
+
+    def __init__(self, config_dict: dict):
+        super().__init__()
+        self.config = VJEPARecursiveConfig(**config_dict)
+        self.head_type = config_dict.get("head_type", "multi")
+
+        if self.head_type == "multi":
+            self.inner = VJEPARecursiveClassifier_MultiHead_Inner(self.config)
+        else:
+            self.inner = VJEPARecursiveClassifier_ACTV1_Inner(self.config)
+
+    def initial_carry(
+        self,
+        batch_size: int,
+        seq_len: int,
+        vjepa_features: torch.Tensor,
+        labels: torch.Tensor
+    ) -> VJEPARecursiveCarry:
+        """Create initial carry state for a batch."""
+        device = vjepa_features.device
+        return VJEPARecursiveCarry(
+            inner_carry=self.inner.empty_carry(batch_size, seq_len, device=device),
+            steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size,), dtype=torch.bool, device=device),
+            vjepa_features=vjepa_features,
+            labels=labels,
+        )
+
+    def forward(
+        self,
+        carry: VJEPARecursiveCarry,
+        vjepa_features: torch.Tensor,
+        labels: torch.Tensor
+    ) -> Tuple[VJEPARecursiveCarry, Dict[str, torch.Tensor]]:
+        """
+        Forward pass with ACT control.
+        """
+        batch_size, seq_len, _ = vjepa_features.shape
+
+        new_inner_carry = self.inner.reset_carry(
+            carry.halted,
+            carry.inner_carry,
+            seq_len
+        )
+
+        new_steps = torch.where(carry.halted, 0, carry.steps)
+
+        new_vjepa_features = torch.where(
+            carry.halted.view(-1, 1, 1),
+            vjepa_features,
+            carry.vjepa_features
+        )
+        new_labels = torch.where(carry.halted, labels, carry.labels)
+
+        if self.head_type == "multi":
+            new_inner_carry, logits_dict, (q_halt_logits, q_continue_logits) = self.inner(
+                new_inner_carry,
+                new_vjepa_features
+            )
+            outputs = {
+                **logits_dict,
+                "q_halt_logits": q_halt_logits,
+                "q_continue_logits": q_continue_logits,
+            }
+        else:
+            new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(
+                new_inner_carry,
+                new_vjepa_features
+            )
+            outputs = {
+                "logits": logits,
+                "q_halt_logits": q_halt_logits,
+                "q_continue_logits": q_continue_logits,
+            }
+
+        with torch.no_grad():
+            new_steps = new_steps + 1
+            is_last_step = new_steps >= self.config.halt_max_steps
+
+            halted = is_last_step
+
+            if self.training and (self.config.halt_max_steps > 1):
+                if self.config.no_ACT_continue:
+                    halted = halted | (q_halt_logits > 0)
+                else:
+                    halted = halted | (q_halt_logits > q_continue_logits)
+
                 min_halt_steps = (
                     (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) *
                     torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)

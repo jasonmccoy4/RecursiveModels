@@ -1,13 +1,13 @@
 """
-Something-Something V2 Video Dataset
+Video Dataset Loaders for V-JEPA 2 Training
 
-Dataset loader for the Something-Something V2 video classification dataset.
-Handles video loading, frame sampling, and batching for V-JEPA 2 training.
+Supports multiple video classification datasets:
+- Something-Something V2 (SSv2): 174 classes, direction-sensitive actions
+- Diving48: 48 diving action classes
 
-Dataset download:
-    Download from https://developer.qualcomm.com/software/ai-datasets/something-something
-    - 19 WebM video files (~19.4GB total)
-    - Annotation JSON files
+Dataset downloads:
+    SSv2: https://developer.qualcomm.com/software/ai-datasets/something-something
+    Diving48: http://www.svcl.ucsd.edu/projects/resound/dataset.html
 
 Expected directory structure:
     data/ssv2/
@@ -18,6 +18,14 @@ Expected directory structure:
     ├── something-something-v2-train.json    # Training annotations
     ├── something-something-v2-validation.json
     └── something-something-v2-labels.json   # 174 class labels
+
+    data/diving48/
+    ├── videos/                              # Contains all .mp4 video files
+    │   ├── _8Vy3dlHg2w_00000.mp4
+    │   └── ...
+    ├── Diving48_train.json                  # Training annotations
+    ├── Diving48_test.json                   # Test annotations
+    └── Diving48_vocab.json                  # 48 class labels
 """
 
 import os
@@ -457,3 +465,341 @@ def create_ssv2_config(
     )
 
     return train_config, val_config
+
+
+# =============================================================================
+# Diving48 Dataset
+# =============================================================================
+
+class Diving48DatasetConfig(pydantic.BaseModel):
+    """Configuration for Diving48 dataset."""
+
+    seed: int
+    data_root: str  # Path to video files directory
+    annotations_path: str  # Path to annotations JSON
+    labels_path: Optional[str] = None  # Path to vocab JSON (optional, labels are integers)
+
+    num_frames: int = 64  # V-JEPA 2 expects 64 frames
+    frame_size: int = 256  # V-JEPA 2 crop size
+
+    global_batch_size: int
+    rank: int = 0
+    num_replicas: int = 1
+
+    # Data augmentation config (None = use defaults based on split)
+    augment_config: Optional[VideoAugmentConfig] = None
+
+    # Diving48 allows horizontal flip (unlike SSv2)
+    enable_horizontal_flip: bool = True
+    horizontal_flip_prob: float = 0.5
+
+
+class Diving48DatasetMetadata(pydantic.BaseModel):
+    """Metadata for Diving48 dataset."""
+
+    num_classes: int = 48
+    num_frames: int = 64
+    frame_size: int = 256
+    total_samples: int
+    sets: List[str] = ["train", "test"]
+
+
+class Diving48Dataset(IterableDataset):
+    """
+    Diving48 video classification dataset.
+
+    Fine-grained diving action recognition with 48 classes.
+    Unlike SSv2, horizontal flipping is allowed as actions are not direction-sensitive.
+    """
+
+    def __init__(self, config: Diving48DatasetConfig, split: str = "train"):
+        super().__init__()
+        self.config = config
+        self.split = split
+        self.is_train = (split == "train")
+
+        # Load annotations
+        with open(config.annotations_path, "r") as f:
+            annotations = json.load(f)
+
+        # Diving48 annotation format: [{"vid_name": "...", "label": int}, ...]
+        # or {"video_id": "...", "label": int}
+        self.samples = []
+        for ann in annotations:
+            video_id = ann.get("vid_name", ann.get("video_id", ann.get("id")))
+            label = ann["label"]
+            self.samples.append((video_id, label))
+
+        # Load label names if provided (optional)
+        self.label_names = None
+        if config.labels_path and os.path.exists(config.labels_path):
+            with open(config.labels_path, "r") as f:
+                self.label_names = json.load(f)
+
+        self.metadata = Diving48DatasetMetadata(
+            num_classes=48,
+            num_frames=config.num_frames,
+            frame_size=config.frame_size,
+            total_samples=len(self.samples)
+        )
+
+        self.local_batch_size = config.global_batch_size // config.num_replicas
+
+        # Random state for reproducibility
+        self._base_seed = config.seed + config.rank
+        self._epoch = 0
+        self._rng = np.random.Generator(np.random.Philox(seed=self._base_seed))
+
+        # Set up augmentation pipeline
+        if config.augment_config is not None:
+            self.augment_config = config.augment_config
+        else:
+            self.augment_config = (
+                get_default_train_augment_config() if self.is_train
+                else get_default_val_augment_config()
+            )
+        self.augmentor = VideoAugmentor(self.augment_config, self._rng)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch for proper shuffling in distributed training."""
+        self._epoch = epoch
+        self._rng = np.random.Generator(np.random.Philox(seed=self._base_seed + epoch * 1000))
+        self.augmentor = VideoAugmentor(self.augment_config, self._rng)
+
+    def _get_video_path(self, video_id: str) -> str:
+        """Get full path to video file."""
+        # Try common extensions
+        for ext in [".mp4", ".webm", ".avi", ".mkv"]:
+            path = os.path.join(self.config.data_root, f"{video_id}{ext}")
+            if os.path.exists(path):
+                return path
+
+        # Try without extension
+        path = os.path.join(self.config.data_root, video_id)
+        if os.path.exists(path):
+            return path
+
+        raise FileNotFoundError(f"Video not found: {video_id}")
+
+    def _apply_horizontal_flip(self, frames: torch.Tensor) -> torch.Tensor:
+        """Apply horizontal flip to all frames."""
+        return torch.flip(frames, dims=[-1])  # Flip along width dimension
+
+    def _load_sample(self, video_id: str, label: int) -> Optional[Dict[str, torch.Tensor]]:
+        """Load a single video sample with augmentation."""
+        try:
+            video_path = self._get_video_path(video_id)
+
+            # Get frame count and compute sampling indices
+            total_frames = get_video_frame_count(video_path)
+            num_frames = self.config.num_frames
+
+            # Apply temporal jittering during training
+            if self.is_train and self.augment_config.temporal_jitter:
+                frame_indices = apply_temporal_jitter(
+                    total_frames=total_frames,
+                    num_frames=num_frames,
+                    rng=self._rng,
+                    jitter_range=self.augment_config.temporal_jitter_range
+                )
+            else:
+                frame_indices = uniform_temporal_sample(total_frames, num_frames)
+
+            # Load video frames
+            frames = load_video(video_path, frame_indices)
+
+            # Apply augmentation pipeline
+            target_size = self.config.frame_size
+            frames = self.augmentor(frames, target_size)
+
+            # Apply horizontal flip (Diving48 allows this, unlike SSv2)
+            if self.is_train and self.config.enable_horizontal_flip:
+                if self._rng.random() < self.config.horizontal_flip_prob:
+                    frames = self._apply_horizontal_flip(frames)
+
+            frames = frames.to(torch.uint8)
+
+            return {
+                "video_frames": frames,
+                "labels": torch.tensor(label, dtype=torch.long),
+                "video_id": video_id
+            }
+        except Exception as e:
+            print(f"Warning: Failed to load video {video_id}: {e}")
+            return None
+
+    def _iter_train(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """Training iterator with shuffling."""
+        epoch_rng = np.random.Generator(np.random.Philox(seed=self._base_seed + self._epoch * 1000))
+        indices = epoch_rng.permutation(len(self.samples))
+
+        # Shard across distributed ranks
+        rank = self.config.rank
+        num_replicas = self.config.num_replicas
+        if num_replicas > 1:
+            total_samples = len(indices)
+            samples_per_rank = (total_samples + num_replicas - 1) // num_replicas
+            padding_size = samples_per_rank * num_replicas - total_samples
+            if padding_size > 0:
+                indices = np.concatenate([indices, indices[:padding_size]])
+            indices = indices[rank * samples_per_rank:(rank + 1) * samples_per_rank]
+
+        # Shard across DataLoader workers
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            indices = indices[worker_info.id::worker_info.num_workers]
+
+        batch_frames = []
+        batch_labels = []
+        batch_ids = []
+
+        for idx in indices:
+            video_id, label = self.samples[idx]
+            sample = self._load_sample(video_id, label)
+
+            if sample is not None:
+                batch_frames.append(sample["video_frames"])
+                batch_labels.append(sample["labels"])
+                batch_ids.append(sample["video_id"])
+
+                if len(batch_frames) >= self.local_batch_size:
+                    yield {
+                        "video_frames": torch.stack(batch_frames),
+                        "labels": torch.stack(batch_labels),
+                        "video_ids": batch_ids
+                    }
+                    batch_frames = []
+                    batch_labels = []
+                    batch_ids = []
+
+    def _iter_test(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """Test/validation iterator (no shuffling)."""
+        rank = self.config.rank
+        num_replicas = self.config.num_replicas
+        samples = list(self.samples)
+
+        if num_replicas > 1:
+            total_samples = len(samples)
+            samples_per_rank = (total_samples + num_replicas - 1) // num_replicas
+            padding_size = samples_per_rank * num_replicas - total_samples
+            if padding_size > 0:
+                samples = samples + samples[:padding_size]
+            samples = samples[rank * samples_per_rank:(rank + 1) * samples_per_rank]
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            samples = samples[worker_info.id::worker_info.num_workers]
+
+        batch_frames = []
+        batch_labels = []
+        batch_ids = []
+
+        for video_id, label in samples:
+            sample = self._load_sample(video_id, label)
+
+            if sample is not None:
+                batch_frames.append(sample["video_frames"])
+                batch_labels.append(sample["labels"])
+                batch_ids.append(sample["video_id"])
+
+                if len(batch_frames) >= self.local_batch_size:
+                    yield {
+                        "video_frames": torch.stack(batch_frames),
+                        "labels": torch.stack(batch_labels),
+                        "video_ids": batch_ids
+                    }
+                    batch_frames = []
+                    batch_labels = []
+                    batch_ids = []
+
+        if batch_frames:
+            yield {
+                "video_frames": torch.stack(batch_frames),
+                "labels": torch.stack(batch_labels),
+                "video_ids": batch_ids
+            }
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        if self.is_train:
+            yield from self._iter_train()
+        else:
+            yield from self._iter_test()
+
+
+def create_diving48_dataloader(
+    config: Diving48DatasetConfig,
+    split: str,
+    num_workers: int = 4,
+    prefetch_factor: int = 2
+) -> Tuple[DataLoader, Diving48DatasetMetadata]:
+    """
+    Create DataLoader for Diving48.
+
+    Args:
+        config: Dataset configuration
+        split: "train" or "test"
+        num_workers: Number of data loading workers
+        prefetch_factor: Number of batches to prefetch per worker
+
+    Returns:
+        dataloader: PyTorch DataLoader
+        metadata: Dataset metadata
+    """
+    dataset = Diving48Dataset(config, split=split)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=False
+    )
+
+    return dataloader, dataset.metadata
+
+
+def create_diving48_config(
+    data_root: str,
+    train_annotations: str,
+    test_annotations: str,
+    labels_path: Optional[str] = None,
+    global_batch_size: int = 32,
+    num_frames: int = 64,
+    seed: int = 42,
+    rank: int = 0,
+    num_replicas: int = 1,
+    train_augment_config: Optional[VideoAugmentConfig] = None,
+    test_augment_config: Optional[VideoAugmentConfig] = None,
+    enable_horizontal_flip: bool = True,
+) -> Tuple[Diving48DatasetConfig, Diving48DatasetConfig]:
+    """
+    Create train and test dataset configs for Diving48.
+    """
+    train_config = Diving48DatasetConfig(
+        seed=seed,
+        data_root=data_root,
+        annotations_path=train_annotations,
+        labels_path=labels_path,
+        num_frames=num_frames,
+        global_batch_size=global_batch_size,
+        rank=rank,
+        num_replicas=num_replicas,
+        augment_config=train_augment_config,
+        enable_horizontal_flip=enable_horizontal_flip,
+    )
+
+    test_config = Diving48DatasetConfig(
+        seed=seed,
+        data_root=data_root,
+        annotations_path=test_annotations,
+        labels_path=labels_path,
+        num_frames=num_frames,
+        global_batch_size=global_batch_size,
+        rank=rank,
+        num_replicas=num_replicas,
+        augment_config=test_augment_config,
+        enable_horizontal_flip=False,  # No flip for test
+    )
+
+    return train_config, test_config
