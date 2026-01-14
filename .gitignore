@@ -2,3 +2,5 @@ wandb
 outputs
 __pycache__
 data
+# Ignore all model files
+*.pt

@@ -22,7 +22,7 @@ num_frames: 64  # V-JEPA 2 expects 64 frames
 frame_size: 256  # V-JEPA 2 crop size
 
 # Training hyperparams
-global_batch_size: 2  # Smaller than ARC due to video memory requirements
+global_batch_size: 4  # Smaller than ARC due to video memory requirements
 epochs: 5
 eval_interval: 1  # Evaluate every 5 epochs
 checkpoint_every_eval: True
@@ -41,7 +41,7 @@ weight_decay: 0.05
 mixed_precision: True
 
 # Gradient accumulation (increase effective batch size)
-gradient_accumulation_steps: 384  # Effective batch
+gradient_accumulation_steps: 192  # Effective batch
 
 num_workers: 4
 

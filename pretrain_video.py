@@ -107,6 +107,7 @@ class VideoPretrainConfig(pydantic.BaseModel):
 
     # DataLoader
     num_workers: int = 4
+    prefetch_factor: int = 2
 
     # Names and checkpointing
     project_name: Optional[str] = None
@@ -154,7 +155,8 @@ def create_video_dataloader(
     split: str,
     rank: int,
     world_size: int,
-    num_workers: int = 4
+    num_workers: int = 4,
+    prefetch_factor: int = 2
 ) -> tuple:
     """Create video dataloader for the configured dataset.
 
@@ -179,7 +181,7 @@ def create_video_dataloader(
             rank=rank,
             num_replicas=world_size,
         )
-        return create_diving48_dataloader(dataset_config, diving48_split, num_workers=num_workers)
+        return create_diving48_dataloader(dataset_config, diving48_split, num_workers=num_workers, prefetch_factor=prefetch_factor)
     else:
         # Default: SSv2
         dataset_config = SSV2DatasetConfig(
@@ -193,7 +195,7 @@ def create_video_dataloader(
             rank=rank,
             num_replicas=world_size,
         )
-        return create_ssv2_dataloader(dataset_config, split, num_workers=num_workers)
+        return create_ssv2_dataloader(dataset_config, split, num_workers=num_workers, prefetch_factor=prefetch_factor)
 
 
 def create_model(
@@ -254,8 +256,8 @@ def train_batch(
     train_state.step += 1
 
     # Move to device
-    video_frames = batch["video_frames"].cuda()  # (B, T, C, H, W)
-    labels = batch["labels"].cuda()  # (B,)
+    video_frames = batch["video_frames"].cuda(non_blocking=True)  # (B, T, C, H, W)
+    labels = batch["labels"].cuda(non_blocking=True)  # (B,)
 
     batch_size, num_frames = video_frames.shape[:2]
 
@@ -264,7 +266,7 @@ def train_batch(
         video_frames,
         return_tensors="pt"
     )
-    pixel_values = processed["pixel_values_videos"].to("cuda")
+    pixel_values = processed["pixel_values_videos"].to("cuda", non_blocking=True)
 
     # Extract V-JEPA 2 features (frozen, no gradients)
     with torch.no_grad():
@@ -361,8 +363,8 @@ def evaluate(
 
     with torch.inference_mode():
         for batch in eval_loader:
-            video_frames = batch["video_frames"].cuda()
-            labels = batch["labels"].cuda()
+            video_frames = batch["video_frames"].cuda(non_blocking=True)
+            labels = batch["labels"].cuda(non_blocking=True)
             batch_size = labels.shape[0]
 
             # Extract V-JEPA 2 features
@@ -370,7 +372,7 @@ def evaluate(
                 video_frames,
                 return_tensors="pt"
             )
-            pixel_values = processed["pixel_values_videos"].to("cuda")
+            pixel_values = processed["pixel_values_videos"].to("cuda", non_blocking=True)
             vjepa_features = train_state.vjepa_extractor(pixel_values)
             vjepa_features = vjepa_features.to(torch.bfloat16)
 
@@ -484,8 +486,8 @@ def launch(hydra_config: DictConfig):
     torch.random.manual_seed(config.seed + RANK)
 
     # Create dataloaders
-    train_loader, train_metadata = create_video_dataloader(config, "train", RANK, WORLD_SIZE, config.num_workers)
-    val_loader, val_metadata = create_video_dataloader(config, "validation", RANK, WORLD_SIZE, config.num_workers)
+    train_loader, train_metadata = create_video_dataloader(config, "train", RANK, WORLD_SIZE, config.num_workers, prefetch_factor=config.prefetch_factor)
+    val_loader, val_metadata = create_video_dataloader(config, "validation", RANK, WORLD_SIZE, config.num_workers, prefetch_factor=config.prefetch_factor)
 
     # Create V-JEPA 2 feature extractor (frozen)
     if RANK == 0:

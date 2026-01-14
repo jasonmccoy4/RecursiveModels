@@ -26,14 +26,14 @@ frame_size: 256  # V-JEPA 2 crop size
 
 # Training hyperparams
 global_batch_size: 4  # Smaller than ARC due to video memory requirements
-epochs: 48
-eval_interval: 3  # Evaluate every 5 epochs
+epochs: 50
+eval_interval: 5  # Evaluate every 5 epochs
 checkpoint_every_eval: True
 
 # Learning rate schedule
-lr: 2.5e-6
+lr: 1e-6
 lr_min_ratio: 0.1
-lr_warmup_steps: 100
+lr_warmup_steps: 1000
 
 # Optimizer settings
 beta1: 0.95
@@ -47,5 +47,6 @@ mixed_precision: True
 gradient_accumulation_steps: 16  # Effective batch size = 4 * 16 = 64
 
 num_workers: 12
+prefetch_factor: 2
 
 seed: 42
