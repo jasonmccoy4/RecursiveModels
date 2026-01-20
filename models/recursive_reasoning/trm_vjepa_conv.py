@@ -1,15 +1,14 @@
 """
-V-JEPA 2 Recursive Video Classifier
+V-JEPA 2 Recursive Video Classifier with Scalar Gated Feature Grouping
 
-Adapts the TinyRecursiveReasoningModel (TRM) architecture for video classification
-using V-JEPA 2 as a frozen feature extractor. Key changes from original TRM:
+Like trm_vjepa_gated but with a 3-level recursive structure (H, L, G).
+z_G acts as an element-wise gate on grouped VJEPA features.
 
-1. Input: V-JEPA 2 features (1024-dim) instead of token embeddings
-2. Hidden size: 1024 (matched to V-JEPA 2)
-3. Output: Classification head (174 classes) instead of LM head
-4. Pooling: Mean pooling over full V-JEPA sequence for classification
-5. ACT: Retained for adaptive computation
-6. Position encoding: 3D-RoPE for spatial-temporal structure (T, H, W)
+Architecture:
+1. Input: V-JEPA 2 features (1024-dim)
+2. Feature grouping: 1024 -> hidden_size groups (e.g., 256 groups of 4)
+3. z_G gates each group via sigmoid
+4. 3-level recursion: H_cycles > G_cycles > L_cycles
 """
 
 from typing import Tuple, Dict
@@ -32,6 +31,7 @@ class VJEPARecursiveCarry_Inner:
     """Inner carry state for recursive reasoning."""
     z_H: torch.Tensor  # High-level reasoning state: (B, S, D)
     z_L: torch.Tensor  # Low-level reasoning state: (B, S, D)
+    z_G: torch.Tensor  # Convolutional gate state: (B, S, D)
 
 
 @dataclass
@@ -42,27 +42,28 @@ class VJEPARecursiveCarry:
     steps: torch.Tensor  # Step counter per sample: (B,)
     halted: torch.Tensor  # Halt flag per sample: (B,)
 
-    vjepa_features: torch.Tensor  # Cached V-JEPA features: (B, S, D)
+    vjepa_features: torch.Tensor  # Cached V-JEPA features: (B, S, D_vjepa)
     labels: torch.Tensor  # Ground truth labels: (B,)
 
 
 class VJEPARecursiveConfig(BaseModel):
-    """Configuration for V-JEPA 2 Recursive Classifier."""
+    """Configuration for V-JEPA 2 Recursive Classifier with Conv Gating."""
 
     batch_size: int
 
     # V-JEPA 2 config
     vjepa_hidden_size: int = 1024  # V-JEPA 2 ViT-L output dimension
 
-    # Recursive model config
-    hidden_size: int = 1024  # Match V-JEPA 2
-    H_cycles: int = 3
-    L_cycles: int = 6
+    # Recursive model config - original TRM dimensions
+    hidden_size: int = 512  # Original TRM dimension
+    H_cycles: int = 2
+    L_cycles: int = 4
+    G_cycles: int = 3
     L_layers: int = 2
 
-    # Transformer config
+    # Transformer config - original TRM
     expansion: float = 4.0
-    num_heads: int = 16  # 1024 / 64 = 16 heads
+    num_heads: int = 4  # Original TRM: 4 heads, head_dim=128
     pos_encodings: str = "rope"
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -72,15 +73,8 @@ class VJEPARecursiveConfig(BaseModel):
     halt_exploration_prob: float = 0.1
     no_ACT_continue: bool = True
 
-    # Input injection mode: "constant" | "gated" | "initial_only"
-    input_injection_mode: str = "constant"
-    input_gate_init: float = 1.0  # Only used for "gated" mode
-
     # Classification config
     num_classes: int = 174  # Something-Something V2
-
-    # Cross-attention config (legacy, unused)
-    cross_attn_heads: int = 8
 
     # 3D-RoPE config for V-JEPA spatial-temporal structure
     grid_size: Tuple[int, int, int] = (32, 16, 16)  # (T, H, W) for V-JEPA 2
@@ -140,9 +134,49 @@ class VJEPARecursiveReasoningModule(nn.Module):
         return hidden_states
 
 
+class ScalarGatedFeatureGrouping(nn.Module):
+    """
+    Scalar gated feature grouping - no learned projection.
+
+    Groups VJEPA features into hidden_size groups, sums each group,
+    then applies z_G as a scalar gate per group.
+
+    Example: 1024 features -> 256 groups of 4 -> sum each group -> gate by z_G
+    """
+
+    def __init__(self, config: VJEPARecursiveConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.group_size = config.vjepa_hidden_size // config.hidden_size  # e.g., 1024/256 = 4
+
+    def forward(self, vjepa_features: torch.Tensor, z_G: torch.Tensor) -> torch.Tensor:
+        """
+        Apply scalar gated feature grouping.
+
+        Args:
+            vjepa_features: (B, S, 1024) V-JEPA 2 features
+            z_G: (B, S, hidden_size) gating state (one scalar per group)
+
+        Returns:
+            output: (B, S, hidden_size) grouped and gated features
+        """
+        B, S, _ = vjepa_features.shape
+
+        # Reshape to groups: (B, S, 1024) -> (B, S, 256, 4)
+        x = vjepa_features.view(B, S, -1, self.group_size)
+
+        # Sum each group: (B, S, 256, 4) -> (B, S, 256)
+        x = x.sum(dim=-1)
+
+        # Apply z_G as scalar gate per group
+        gate = torch.sigmoid(z_G)
+
+        return x * gate
+
+
 class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
     """
-    Inner model for V-JEPA 2 recursive video classification.
+    Inner model for V-JEPA 2 recursive video classification with scalar gated feature grouping.
 
     Takes V-JEPA 2 features and performs recursive reasoning to produce
     classification logits and ACT halting decisions.
@@ -161,12 +195,15 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
                 base=config.rope_theta
             )
 
+        # Scalar gated feature grouping (groups input features, z_G gates each group)
+        self.gated_proj = ScalarGatedFeatureGrouping(config)
+
         # Recursive reasoning layers (L-level, same structure as TRM)
         self.L_level = VJEPARecursiveReasoningModule(
             layers=[VJEPARecursiveBlock(config) for _ in range(config.L_layers)]
         )
 
-        # Initial states for H and L
+        # Initial states for H, L, and G
         self.H_init = nn.Buffer(
             trunc_normal_init_(
                 torch.empty(config.hidden_size, dtype=self.forward_dtype),
@@ -175,6 +212,13 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
             persistent=True
         )
         self.L_init = nn.Buffer(
+            trunc_normal_init_(
+                torch.empty(config.hidden_size, dtype=self.forward_dtype),
+                std=1
+            ),
+            persistent=True
+        )
+        self.G_init = nn.Buffer(
             trunc_normal_init_(
                 torch.empty(config.hidden_size, dtype=self.forward_dtype),
                 std=1
@@ -193,10 +237,6 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
 
-        # Learnable gate for gated input injection mode
-        if config.input_injection_mode == "gated":
-            self.input_gate = nn.Parameter(torch.tensor(config.input_gate_init))
-
     def empty_carry(self, batch_size: int, seq_len: int, device: torch.device = None) -> VJEPARecursiveCarry_Inner:
         """Create empty inner carry state."""
         if device is None:
@@ -210,6 +250,10 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
                 batch_size, seq_len, self.config.hidden_size,
                 dtype=self.forward_dtype, device=device
             ),
+            z_G=torch.empty(
+                batch_size, seq_len, self.config.hidden_size,
+                dtype=self.forward_dtype, device=device
+            ),
         )
 
     def reset_carry(
@@ -217,30 +261,21 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         reset_flag: torch.Tensor,
         carry: VJEPARecursiveCarry_Inner,
         seq_len: int,
-        input_embeddings: torch.Tensor = None
+        input_embeddings: torch.Tensor = None  # Unused (kept for API compatibility)
     ) -> VJEPARecursiveCarry_Inner:
-        """Reset carry state for halted sequences.
-
-        Args:
-            reset_flag: Boolean tensor indicating which sequences to reset
-            carry: Current carry state
-            seq_len: Sequence length
-            input_embeddings: Optional input embeddings for initial_only mode
-        """
+        """Reset carry state for halted sequences."""
+        del input_embeddings  # Explicitly mark as unused
         batch_size = reset_flag.shape[0]
 
         # Expand init states to sequence length
         H_init_expanded = self.H_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
-
-        # For initial_only mode, initialize z_L with input_embeddings
-        if self.config.input_injection_mode == "initial_only" and input_embeddings is not None:
-            L_init_expanded = input_embeddings
-        else:
-            L_init_expanded = self.L_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
+        L_init_expanded = self.L_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
+        G_init_expanded = self.G_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
 
         return VJEPARecursiveCarry_Inner(
             z_H=torch.where(reset_flag.view(-1, 1, 1), H_init_expanded, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), L_init_expanded, carry.z_L),
+            z_G=torch.where(reset_flag.view(-1, 1, 1), G_init_expanded, carry.z_G),
         )
 
     def forward(
@@ -249,10 +284,17 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         vjepa_features: torch.Tensor
     ) -> Tuple[VJEPARecursiveCarry_Inner, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass through recursive reasoning.
+        Forward pass through recursive reasoning with 3-level structure.
+
+        z_G gates the grouped VJEPA features (1024 -> hidden_size).
+
+        Structure:
+        - L_cycles (inner): z_L updates with gated input injection
+        - G_cycles (middle): z_G (gate state) updates based on z_L
+        - H_cycles (outer): z_H updates based on z_L
 
         Args:
-            carry: Inner carry state (z_H, z_L)
+            carry: Inner carry state (z_H, z_L, z_G)
             vjepa_features: V-JEPA 2 encoder features (B, S, 1024)
 
         Returns:
@@ -265,31 +307,27 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         )
 
         # Extract states
-        z_H, z_L = carry.z_H, carry.z_L
-
-        # Compute input injection based on mode
-        input_embeddings = vjepa_features
-        mode = self.config.input_injection_mode
+        z_H, z_L, z_G = carry.z_H, carry.z_L, carry.z_G
 
         def get_injection():
-            if mode == "constant":
-                return z_H + input_embeddings
-            elif mode == "gated":
-                gate = torch.sigmoid(self.input_gate)
-                return z_H + gate * input_embeddings
-            else:  # "initial_only"
-                return z_H  # Pure recursive link, no input injection
+            # z_G gates the grouped VJEPA features
+            projected_input = self.gated_proj(vjepa_features, z_G)
+            return z_H + projected_input
 
         # H_cycles-1 without grad (same pattern as TRM)
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, get_injection(), **seq_info)
+                for _G_step in range(self.config.G_cycles):
+                    for _L_step in range(self.config.L_cycles):
+                        z_L = self.L_level(z_L, get_injection(), **seq_info)
+                    z_G = self.L_level(z_G, z_L, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Final iteration with gradients
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, get_injection(), **seq_info)
+        for _G_step in range(self.config.G_cycles):
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, get_injection(), **seq_info)
+            z_G = self.L_level(z_G, z_L, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Mean pooling for classification (aggregate all spatial-temporal info)
@@ -303,6 +341,7 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         new_carry = VJEPARecursiveCarry_Inner(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
+            z_G=z_G.detach(),
         )
 
         return new_carry, logits, (q_logits[..., 0], q_logits[..., 1])
@@ -310,7 +349,7 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
 
 class VJEPARecursiveClassifier_ACTV1(nn.Module):
     """
-    ACT wrapper for V-JEPA 2 recursive video classifier.
+    ACT wrapper for V-JEPA 2 recursive video classifier with scalar gated feature grouping.
 
     Implements Adaptive Computation Time: the model learns when to stop
     reasoning based on Q-values that predict classification correctness.
@@ -361,7 +400,6 @@ class VJEPARecursiveClassifier_ACTV1(nn.Module):
         batch_size, seq_len, _ = vjepa_features.shape
 
         # Reset carry for halted sequences (starting fresh)
-        # For initial_only mode, pass input_embeddings to initialize z_L
         new_inner_carry = self.inner.reset_carry(
             carry.halted,
             carry.inner_carry,
@@ -425,7 +463,7 @@ class VJEPARecursiveClassifier_ACTV1(nn.Module):
 
 class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_Inner):
     """
-    Multi-head variant for Diving48 classification.
+    Multi-head variant for Diving48 classification with scalar gated feature grouping.
 
     Outputs separate logits for each component:
     - Position (6 classes)
@@ -461,7 +499,12 @@ class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_In
         vjepa_features: torch.Tensor
     ) -> Tuple[VJEPARecursiveCarry_Inner, Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass with multi-head output.
+        Forward pass with multi-head output and scalar gated feature grouping.
+
+        Structure:
+        - L_cycles (inner): z_L updates with gated input injection
+        - G_cycles (middle): z_G (gate state) updates based on z_L
+        - H_cycles (outer): z_H updates based on z_L
 
         Returns:
             new_carry: Updated carry state
@@ -472,31 +515,27 @@ class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_In
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
-        z_H, z_L = carry.z_H, carry.z_L
-
-        # Compute input injection based on mode
-        input_embeddings = vjepa_features
-        mode = self.config.input_injection_mode
+        z_H, z_L, z_G = carry.z_H, carry.z_L, carry.z_G
 
         def get_injection():
-            if mode == "constant":
-                return z_H + input_embeddings
-            elif mode == "gated":
-                gate = torch.sigmoid(self.input_gate)
-                return z_H + gate * input_embeddings
-            else:  # "initial_only"
-                return z_H  # Pure recursive link, no input injection
+            # z_G gates the grouped VJEPA features
+            projected_input = self.gated_proj(vjepa_features, z_G)
+            return z_H + projected_input
 
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, get_injection(), **seq_info)
+                for _G_step in range(self.config.G_cycles):
+                    for _L_step in range(self.config.L_cycles):
+                        z_L = self.L_level(z_L, get_injection(), **seq_info)
+                    z_G = self.L_level(z_G, z_L, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Final iteration with gradients
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, get_injection(), **seq_info)
+        for _G_step in range(self.config.G_cycles):
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, get_injection(), **seq_info)
+            z_G = self.L_level(z_G, z_L, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Mean pooling for multi-head classification
@@ -512,6 +551,7 @@ class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_In
         new_carry = VJEPARecursiveCarry_Inner(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
+            z_G=z_G.detach(),
         )
 
         return new_carry, {
@@ -524,7 +564,7 @@ class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_In
 
 class VJEPARecursiveClassifier_MultiHead(nn.Module):
     """
-    ACT wrapper for multi-head Diving48 classifier.
+    ACT wrapper for multi-head Diving48 classifier with scalar gated feature grouping.
 
     Supports both multi-head and single-head modes via head_type config.
     """
@@ -568,7 +608,6 @@ class VJEPARecursiveClassifier_MultiHead(nn.Module):
         batch_size, seq_len, _ = vjepa_features.shape
 
         # Reset carry for halted sequences (starting fresh)
-        # For initial_only mode, pass input_embeddings to initialize z_L
         new_inner_carry = self.inner.reset_carry(
             carry.halted,
             carry.inner_carry,

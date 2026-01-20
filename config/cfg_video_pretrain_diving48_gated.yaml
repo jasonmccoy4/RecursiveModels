@@ -1,8 +1,8 @@
 # Diving48 Video Classification Training Config
-# Uses V-JEPA 2 as frozen feature extractor with recursive classifier
+# Uses V-JEPA 2 with 3-level gated recursive classifier (z_G as element-wise gate)
 
 defaults:
-  - arch: trm_vjepa_diving48
+  - arch: trm_vjepa_gated_diving48
   - _self_
 
 hydra:
@@ -31,9 +31,9 @@ eval_interval: 5  # Evaluate every 5 epochs
 checkpoint_every_eval: True
 
 # Learning rate schedule
-lr: 1e-3
+lr: 3e-5
 lr_min_ratio: 0.1
-lr_warmup_steps: 100
+lr_warmup_steps: 1000
 
 # Optimizer settings
 beta1: 0.9
@@ -44,7 +44,7 @@ weight_decay: 0.1
 mixed_precision: True
 
 # Gradient accumulation (increase effective batch size)
-gradient_accumulation_steps: 32  # Effective batch size = 4 * 16 = 64
+gradient_accumulation_steps: 32  # Effective batch size = 2 * 32 = 64
 
 num_workers: 12
 prefetch_factor: 2
@@ -53,7 +53,5 @@ persistent_workers: True
 # Pre-computed V-JEPA features (set to enable 2x speedup)
 # Run precompute_vjepa_features.py first to generate these
 precomputed_features_dir: "C:\\Users\\Jason\\ai_data\\diving48\\vjepa_features"
-# precomputed_features_dir: null
-# load_checkpoint: "C:\\Users\\Jason\\repos\\RecursiveModels\\checkpoints\\DIVING48-VJEPA-RecursiveClassifier\\vjepa-diving48-glittering-dove\\epoch_29.pt"
 
 seed: 42

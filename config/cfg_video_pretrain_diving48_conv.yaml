@@ -1,8 +1,9 @@
 # Diving48 Video Classification Training Config
-# Uses V-JEPA 2 as frozen feature extractor with recursive classifier
+# Uses V-JEPA 2 with convolutional gating (z_G as conv kernel for 1024->512)
+# Original TRM dimensions: 512 hidden, 4 heads
 
 defaults:
-  - arch: trm_vjepa_diving48
+  - arch: trm_vjepa_conv_diving48
   - _self_
 
 hydra:
@@ -25,16 +26,16 @@ num_frames: 64  # V-JEPA 2 expects 64 frames
 frame_size: 256  # V-JEPA 2 crop size
 
 # Training hyperparams
-global_batch_size: 2  # Smaller than ARC due to video memory requirements
-epochs: 50
-eval_interval: 5  # Evaluate every 5 epochs
+global_batch_size: 4  # Smaller than ARC due to video memory requirements
+epochs: 15
+eval_interval: 1  # Evaluate every 5 epochs
 checkpoint_every_eval: True
 
 # Learning rate schedule
-lr: 1e-3
+lr: 3e-5
 lr_min_ratio: 0.1
-lr_warmup_steps: 100
-
+lr_warmup_steps: 500
+ 
 # Optimizer settings
 beta1: 0.9
 beta2: 0.999
@@ -44,7 +45,7 @@ weight_decay: 0.1
 mixed_precision: True
 
 # Gradient accumulation (increase effective batch size)
-gradient_accumulation_steps: 32  # Effective batch size = 4 * 16 = 64
+gradient_accumulation_steps: 16  # Effective batch size = 2 * 32 = 64
 
 num_workers: 12
 prefetch_factor: 2
@@ -52,8 +53,6 @@ persistent_workers: True
 
 # Pre-computed V-JEPA features (set to enable 2x speedup)
 # Run precompute_vjepa_features.py first to generate these
-precomputed_features_dir: "C:\\Users\\Jason\\ai_data\\diving48\\vjepa_features"
-# precomputed_features_dir: null
-# load_checkpoint: "C:\\Users\\Jason\\repos\\RecursiveModels\\checkpoints\\DIVING48-VJEPA-RecursiveClassifier\\vjepa-diving48-glittering-dove\\epoch_29.pt"
+precomputed_features_dir: null
 
 seed: 42

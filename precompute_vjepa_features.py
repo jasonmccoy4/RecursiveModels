@@ -5,8 +5,11 @@ Pre-computes and caches V-JEPA 2 features for all videos in a dataset.
 This eliminates the ~70% forward pass overhead of running the frozen V-JEPA 2
 encoder during training.
 
+Supports uniform temporal sampling for different frame counts (16, 64, etc.)
+to match different V-JEPA 2 model variants.
+
 Usage:
-    # For Diving48:
+    # For Diving48 with 64 frames (default):
     python precompute_vjepa_features.py \
         --dataset diving48 \
         --data_root C:/Users/Jason/ai_data/diving48/videos/rgb \
@@ -14,14 +17,24 @@ Usage:
         --val_annotations C:/Users/Jason/ai_data/diving48/Diving48_test.json \
         --output_dir C:/Users/Jason/ai_data/diving48/vjepa_features
 
-    # For SSv2:
+    # For SSv2 with 64 frames:
     python precompute_vjepa_features.py \
         --dataset ssv2 \
         --data_root path/to/ssv2/videos \
         --train_annotations path/to/train.json \
         --val_annotations path/to/validation.json \
         --labels_path path/to/labels.json \
-        --output_dir path/to/ssv2/vjepa_features
+        --output_dir path/to/ssv2/vjepa_features_64
+
+    # For SSv2 with 16 frames (to compare with facebook/vjepa2-vitl-fpc16-256-ssv2):
+    python precompute_vjepa_features.py \
+        --dataset ssv2 \
+        --data_root path/to/ssv2/videos \
+        --train_annotations path/to/train.json \
+        --val_annotations path/to/validation.json \
+        --labels_path path/to/labels.json \
+        --output_dir path/to/ssv2/vjepa_features_16 \
+        --vjepa_model facebook/vjepa2-vitl-fpc16-256-ssv2
 """
 
 import argparse
@@ -89,9 +102,8 @@ def precompute_features(
     output_dir: str,
     labels_path: str = None,
     vjepa_model: str = "facebook/vjepa2-vitl-fpc64-256",
-    num_frames: int = 64,
+    num_frames: int = None,  # Auto-detect from model if not specified
     frame_size: int = 256,
-    batch_size: int = 4,
 ):
     """Pre-compute V-JEPA features for all videos."""
 
@@ -101,6 +113,20 @@ def precompute_features(
     # Load V-JEPA extractor
     print(f"Loading V-JEPA 2 model: {vjepa_model}")
     extractor = create_vjepa_extractor(vjepa_model)
+
+    # Get expected frames from model config
+    model_expected_frames = extractor.get_expected_frames()
+
+    if num_frames is None:
+        # Auto-detect from model
+        num_frames = model_expected_frames
+        print(f"Auto-detected num_frames={num_frames} from model config")
+    elif num_frames != model_expected_frames:
+        print(f"WARNING: num_frames={num_frames} differs from model's expected "
+              f"frames_per_clip={model_expected_frames}")
+        print(f"  Using {num_frames} frames with uniform temporal sampling")
+
+    print(f"Sampling strategy: uniform temporal sampling of {num_frames} frames")
 
     # Load annotations
     print("Loading annotations...")
@@ -181,10 +207,12 @@ def main():
     parser.add_argument("--val_annotations", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for features")
     parser.add_argument("--labels_path", type=str, default=None, help="Path to labels (for SSv2)")
-    parser.add_argument("--vjepa_model", type=str, default="facebook/vjepa2-vitl-fpc64-256")
-    parser.add_argument("--num_frames", type=int, default=64)
-    parser.add_argument("--frame_size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--vjepa_model", type=str, default="facebook/vjepa2-vitl-fpc64-256",
+                        help="V-JEPA 2 model (e.g., facebook/vjepa2-vitl-fpc16-256-ssv2 for 16 frames)")
+    parser.add_argument("--num_frames", type=int, default=None,
+                        help="Number of frames to sample (auto-detected from model if not specified)")
+    parser.add_argument("--frame_size", type=int, default=256,
+                        help="Frame size for V-JEPA (256 for vitl, 384 for vitg)")
 
     args = parser.parse_args()
 
@@ -198,7 +226,6 @@ def main():
         vjepa_model=args.vjepa_model,
         num_frames=args.num_frames,
         frame_size=args.frame_size,
-        batch_size=args.batch_size,
     )
 
 

@@ -1,7 +1,7 @@
 # V-JEPA 2 Recursive Video Classifier Configuration for Diving48
-# Multi-head architecture: predicts position, somersaults, twists, body position separately
+# 3-level gated architecture: z_G acts as element-wise gate for input injection
 
-name: recursive_reasoning.trm_vjepa@VJEPARecursiveClassifier_MultiHead
+name: recursive_reasoning.trm_vjepa_gated@VJEPARecursiveClassifier_MultiHead
 loss:
   name: losses@Diving48MultiHeadACTLossHead
   label_smoothing: 0.1
@@ -21,14 +21,14 @@ hidden_size: 1024  # Match V-JEPA 2 dimension
 num_heads: 16  # 1024 / 64 = 16 heads
 expansion: 2.0
 
-# Recursive structure
-H_cycles: 3  # Outer loops (2 no-grad + 1 with grad)
-L_cycles: 6  # Inner loops per H step
+# 3-level gated recursive structure
+H_cycles: 2  # Outer loops (1 no-grad + 1 with grad)
+G_cycles: 2  # Middle loops for gate evolution
+L_cycles: 4  # Inner loops per G step
 L_layers: 2  # Transformer blocks in L-level
-input_injection_mode: "initial_only"  # "constant" | "gated" | "initial_only"
 
 # ACT (Adaptive Computation Time) config
-halt_max_steps: 8  # Max ACT iterations (reduced from 8 for training speed)
+halt_max_steps: 8  # Max ACT iterations
 halt_exploration_prob: 0.1  # Exploration rate for Q-learning
 no_ACT_continue: True  # Use simple sigmoid halt (no Q-continue)
 

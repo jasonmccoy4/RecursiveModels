@@ -522,7 +522,7 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     return objects[0]
 
 
-@hydra.main(config_path="config", config_name="cfg_video_pretrain_diving48", version_base=None)
+@hydra.main(config_path="config", config_name="cfg_video_pretrain_ssv2_conv", version_base=None)
 def launch(hydra_config: DictConfig):
     """Main training entry point."""
     RANK = 0

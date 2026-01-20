@@ -32,6 +32,7 @@ class VJEPARecursiveCarry_Inner:
     """Inner carry state for recursive reasoning."""
     z_H: torch.Tensor  # High-level reasoning state: (B, S, D)
     z_L: torch.Tensor  # Low-level reasoning state: (B, S, D)
+    z_G: torch.Tensor  # Gated-level reasoning state: (B, S, D)
 
 
 @dataclass
@@ -56,8 +57,9 @@ class VJEPARecursiveConfig(BaseModel):
 
     # Recursive model config
     hidden_size: int = 1024  # Match V-JEPA 2
-    H_cycles: int = 3
-    L_cycles: int = 6
+    H_cycles: int = 2
+    L_cycles: int = 4
+    G_cycles: int = 3
     L_layers: int = 2
 
     # Transformer config
@@ -71,10 +73,6 @@ class VJEPARecursiveConfig(BaseModel):
     halt_max_steps: int = 8
     halt_exploration_prob: float = 0.1
     no_ACT_continue: bool = True
-
-    # Input injection mode: "constant" | "gated" | "initial_only"
-    input_injection_mode: str = "constant"
-    input_gate_init: float = 1.0  # Only used for "gated" mode
 
     # Classification config
     num_classes: int = 174  # Something-Something V2
@@ -181,6 +179,13 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
             ),
             persistent=True
         )
+        self.G_init = nn.Buffer(
+            trunc_normal_init_(
+                torch.empty(config.hidden_size, dtype=self.forward_dtype),
+                std=1
+            ),
+            persistent=True
+        )
 
         # Classification head (replaces lm_head)
         self.classifier = CastedLinear(config.hidden_size, config.num_classes, bias=True)
@@ -192,10 +197,6 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
-
-        # Learnable gate for gated input injection mode
-        if config.input_injection_mode == "gated":
-            self.input_gate = nn.Parameter(torch.tensor(config.input_gate_init))
 
     def empty_carry(self, batch_size: int, seq_len: int, device: torch.device = None) -> VJEPARecursiveCarry_Inner:
         """Create empty inner carry state."""
@@ -210,6 +211,10 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
                 batch_size, seq_len, self.config.hidden_size,
                 dtype=self.forward_dtype, device=device
             ),
+            z_G=torch.empty(
+                batch_size, seq_len, self.config.hidden_size,
+                dtype=self.forward_dtype, device=device
+            ),
         )
 
     def reset_carry(
@@ -217,7 +222,7 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         reset_flag: torch.Tensor,
         carry: VJEPARecursiveCarry_Inner,
         seq_len: int,
-        input_embeddings: torch.Tensor = None
+        input_embeddings: torch.Tensor = None  # Unused in gated version (kept for API compatibility)
     ) -> VJEPARecursiveCarry_Inner:
         """Reset carry state for halted sequences.
 
@@ -225,22 +230,20 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
             reset_flag: Boolean tensor indicating which sequences to reset
             carry: Current carry state
             seq_len: Sequence length
-            input_embeddings: Optional input embeddings for initial_only mode
+            input_embeddings: Unused in gated version (kept for API compatibility)
         """
+        del input_embeddings  # Explicitly mark as unused
         batch_size = reset_flag.shape[0]
 
         # Expand init states to sequence length
         H_init_expanded = self.H_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
-
-        # For initial_only mode, initialize z_L with input_embeddings
-        if self.config.input_injection_mode == "initial_only" and input_embeddings is not None:
-            L_init_expanded = input_embeddings
-        else:
-            L_init_expanded = self.L_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
+        L_init_expanded = self.L_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
+        G_init_expanded = self.G_init.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
 
         return VJEPARecursiveCarry_Inner(
             z_H=torch.where(reset_flag.view(-1, 1, 1), H_init_expanded, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), L_init_expanded, carry.z_L),
+            z_G=torch.where(reset_flag.view(-1, 1, 1), G_init_expanded, carry.z_G),
         )
 
     def forward(
@@ -249,10 +252,15 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         vjepa_features: torch.Tensor
     ) -> Tuple[VJEPARecursiveCarry_Inner, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass through recursive reasoning.
+        Forward pass through recursive reasoning with 3-level gated structure.
+
+        Structure:
+        - L_cycles (inner): z_L updates with gated input injection
+        - G_cycles (middle): z_G (element-wise gate) updates based on z_L
+        - H_cycles (outer): z_H updates based on z_L
 
         Args:
-            carry: Inner carry state (z_H, z_L)
+            carry: Inner carry state (z_H, z_L, z_G)
             vjepa_features: V-JEPA 2 encoder features (B, S, 1024)
 
         Returns:
@@ -265,31 +273,30 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         )
 
         # Extract states
-        z_H, z_L = carry.z_H, carry.z_L
+        z_H, z_L, z_G = carry.z_H, carry.z_L, carry.z_G
 
-        # Compute input injection based on mode
+        # Input embeddings
         input_embeddings = vjepa_features
-        mode = self.config.input_injection_mode
 
         def get_injection():
-            if mode == "constant":
-                return z_H + input_embeddings
-            elif mode == "gated":
-                gate = torch.sigmoid(self.input_gate)
-                return z_H + gate * input_embeddings
-            else:  # "initial_only"
-                return z_H  # Pure recursive link, no input injection
+            # z_G acts as element-wise gate for input injection
+            gate = torch.sigmoid(z_G)
+            return z_H + gate * input_embeddings
 
         # H_cycles-1 without grad (same pattern as TRM)
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, get_injection(), **seq_info)
+                for _G_step in range(self.config.G_cycles):
+                    for _L_step in range(self.config.L_cycles):
+                        z_L = self.L_level(z_L, get_injection(), **seq_info)
+                    z_G = self.L_level(z_G, z_L, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Final iteration with gradients
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, get_injection(), **seq_info)
+        for _G_step in range(self.config.G_cycles):
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, get_injection(), **seq_info)
+            z_G = self.L_level(z_G, z_L, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Mean pooling for classification (aggregate all spatial-temporal info)
@@ -303,6 +310,7 @@ class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
         new_carry = VJEPARecursiveCarry_Inner(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
+            z_G=z_G.detach(),
         )
 
         return new_carry, logits, (q_logits[..., 0], q_logits[..., 1])
@@ -461,7 +469,12 @@ class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_In
         vjepa_features: torch.Tensor
     ) -> Tuple[VJEPARecursiveCarry_Inner, Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward pass with multi-head output.
+        Forward pass with multi-head output and 3-level gated structure.
+
+        Structure:
+        - L_cycles (inner): z_L updates with gated input injection
+        - G_cycles (middle): z_G (element-wise gate) updates based on z_L
+        - H_cycles (outer): z_H updates based on z_L
 
         Returns:
             new_carry: Updated carry state
@@ -472,31 +485,30 @@ class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_In
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
-        z_H, z_L = carry.z_H, carry.z_L
+        z_H, z_L, z_G = carry.z_H, carry.z_L, carry.z_G
 
-        # Compute input injection based on mode
+        # Input embeddings
         input_embeddings = vjepa_features
-        mode = self.config.input_injection_mode
 
         def get_injection():
-            if mode == "constant":
-                return z_H + input_embeddings
-            elif mode == "gated":
-                gate = torch.sigmoid(self.input_gate)
-                return z_H + gate * input_embeddings
-            else:  # "initial_only"
-                return z_H  # Pure recursive link, no input injection
+            # z_G acts as element-wise gate for input injection
+            gate = torch.sigmoid(z_G)
+            return z_H + gate * input_embeddings
 
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles - 1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, get_injection(), **seq_info)
+                for _G_step in range(self.config.G_cycles):
+                    for _L_step in range(self.config.L_cycles):
+                        z_L = self.L_level(z_L, get_injection(), **seq_info)
+                    z_G = self.L_level(z_G, z_L, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Final iteration with gradients
-        for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, get_injection(), **seq_info)
+        for _G_step in range(self.config.G_cycles):
+            for _L_step in range(self.config.L_cycles):
+                z_L = self.L_level(z_L, get_injection(), **seq_info)
+            z_G = self.L_level(z_G, z_L, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # Mean pooling for multi-head classification
@@ -512,6 +524,7 @@ class VJEPARecursiveClassifier_MultiHead_Inner(VJEPARecursiveClassifier_ACTV1_In
         new_carry = VJEPARecursiveCarry_Inner(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
+            z_G=z_G.detach(),
         )
 
         return new_carry, {

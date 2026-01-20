@@ -1,0 +1,59 @@
+# Something-Something V2 Video Classification Training Config
+# Uses V-JEPA 2 with convolutional gating (z_G as conv kernel for 1024->512)
+# Original TRM dimensions: 512 hidden, 4 heads
+
+defaults:
+  - arch: trm_vjepa_conv_ssv2
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Dataset selection
+dataset: ssv2
+
+# Data paths - Update these to your local SSv2 dataset location
+data_root: "C:\\Users\\Jason\\ai_data\\ssv2\\videos"
+train_annotations: "C:\\Users\\Jason\\ai_data\\ssv2\\train.json"
+val_annotations: "C:\\Users\\Jason\\ai_data\\ssv2\\validation.json"
+labels_path: "C:\\Users\\Jason\\ai_data\\ssv2\\labels.json"
+
+# V-JEPA 2 config
+vjepa_model_name: "facebook/vjepa2-vitl-fpc64-256"
+
+# Video config
+num_frames: 16  # V-JEPA 2 expects 64 frames
+frame_size: 256  # V-JEPA 2 crop size
+
+# Training hyperparams
+global_batch_size: 24  # Smaller than ARC due to video memory requirements
+epochs: 15
+eval_interval: 1  # Evaluate every 5 epochs
+checkpoint_every_eval: True
+
+# Learning rate schedule
+lr: 3e-5
+lr_min_ratio: 0.1
+lr_warmup_steps: 1000
+
+# Optimizer settings
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.1
+
+# Mixed precision for efficiency
+mixed_precision: True
+
+# Gradient accumulation (increase effective batch size)
+gradient_accumulation_steps: 3  # Effective batch size = 4 * 16 = 64
+
+num_workers: 12
+prefetch_factor: 2
+persistent_workers: True
+
+# Pre-computed V-JEPA features (set to enable 2x speedup)
+# Run precompute_vjepa_features.py first to generate these
+# Set to null to use raw videos instead
+precomputed_features_dir: null
+
+seed: 42

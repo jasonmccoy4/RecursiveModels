@@ -1,0 +1,46 @@
+# V-JEPA 2 Recursive Video Classifier Configuration for Something-Something V2
+# Scalar gated feature grouping: z_G gates grouped VJEPA features
+# Uses original TRM dimensions: 256 hidden, 4 heads
+
+name: recursive_reasoning.trm_vjepa_conv@VJEPARecursiveClassifier_ACTV1
+loss:
+  name: losses@VideoClassificationACTLossHead
+  label_smoothing: 0.1
+  q_loss_weight: 0.5
+
+# V-JEPA 2 config
+vjepa_hidden_size: 1024  # V-JEPA 2 ViT-L output dimension
+
+# Recursive model config
+# hidden_size determines feature grouping: 1024/hidden_size features per group
+# e.g., hidden_size=256 -> groups of 4, hidden_size=512 -> groups of 2
+hidden_size: 256
+num_heads: 4  # 4 heads, head_dim=64
+expansion: 3.0
+
+# 3-level recursive structure with gated feature grouping
+H_cycles: 2  # Outer loops (1 no-grad + 1 with grad)
+G_cycles: 3  # Middle loops for z_G gate evolution
+L_cycles: 4  # Inner loops per G step
+L_layers: 2  # Transformer blocks in L-level
+
+# ACT (Adaptive Computation Time) config
+halt_max_steps: 8  # Max ACT iterations
+halt_exploration_prob: 0.1  # Exploration rate for Q-learning
+no_ACT_continue: True  # Use simple sigmoid halt (no Q-continue)
+
+# Classification config - SSv2 has 174 classes
+num_classes: 174
+
+# Positional encodings
+pos_encodings: rope
+rope_theta: 10000.0
+
+# 3D-RoPE grid size for V-JEPA spatial-temporal structure
+# For 64 frames: (32, 16, 16) - T=32 temporal tokens (2 frames/token)
+# For 16 frames: (8, 16, 16) - T=8 temporal tokens (2 frames/token)
+grid_size: [8, 16, 16]  # Change to [8, 16, 16] for 16-frame models
+
+# Precision
+forward_dtype: bfloat16
+rms_norm_eps: 1.0e-5
