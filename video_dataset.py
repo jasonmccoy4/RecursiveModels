@@ -44,6 +44,51 @@ from video_augmentation import (
     get_default_train_augment_config,
     get_default_val_augment_config,
 )
+from collections import defaultdict
+
+
+def stratified_subsample(
+    samples: List[Tuple[str, int]],
+    data_size: float,
+    seed: int = 42
+) -> List[Tuple[str, int]]:
+    """
+    Subsample data while maintaining class balance (stratified sampling).
+
+    Args:
+        samples: List of (video_id, label) tuples
+        data_size: Fraction of data to keep (0.0 to 1.0)
+        seed: Random seed for reproducibility
+
+    Returns:
+        Subsampled list maintaining class proportions
+    """
+    if data_size >= 1.0:
+        return samples
+
+    if data_size <= 0.0:
+        return []
+
+    # Group samples by class
+    class_to_samples: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
+    for sample in samples:
+        video_id, label = sample
+        class_to_samples[label].append(sample)
+
+    # Subsample from each class
+    rng = np.random.Generator(np.random.Philox(seed=seed))
+    subsampled = []
+
+    for label, class_samples in class_to_samples.items():
+        n_keep = max(1, int(len(class_samples) * data_size))  # Keep at least 1 per class
+        indices = rng.permutation(len(class_samples))[:n_keep]
+        for idx in indices:
+            subsampled.append(class_samples[idx])
+
+    # Shuffle the final list to mix classes
+    rng = np.random.Generator(np.random.Philox(seed=seed + 1))
+    indices = rng.permutation(len(subsampled))
+    return [subsampled[i] for i in indices]
 
 
 class SSV2DatasetConfig(pydantic.BaseModel):
@@ -56,6 +101,8 @@ class SSV2DatasetConfig(pydantic.BaseModel):
 
     num_frames: int = 64  # V-JEPA 2 expects 64 frames
     frame_size: int = 256  # V-JEPA 2 crop size
+
+    data_size: float = 1.0
 
     global_batch_size: int
     rank: int = 0
@@ -174,6 +221,12 @@ class SSV2Dataset(IterableDataset):
                 self.samples.append((video_id, label))
             else:
                 raise ValueError(f"could not find label for: {ann}")
+
+        # Apply stratified subsampling if data_size < 1.0
+        if config.data_size < 1.0:
+            full_size = len(self.samples)
+            self.samples = stratified_subsample(self.samples, config.data_size, seed=config.seed)
+            print(f"SSV2Dataset [{split}]: Subsampled from {full_size} to {len(self.samples)} samples ({config.data_size*100:.1f}%)")
 
         self.metadata = SSV2DatasetMetadata(
             num_classes=174,
@@ -480,6 +533,7 @@ class Diving48DatasetConfig(pydantic.BaseModel):
     data_root: str  # Path to video files directory
     annotations_path: str  # Path to annotations JSON
     labels_path: Optional[str] = None  # Path to vocab JSON (optional, labels are integers)
+    data_size: float = 1.0
 
     num_frames: int = 64  # V-JEPA 2 expects 64 frames
     frame_size: int = 256  # V-JEPA 2 crop size
@@ -531,6 +585,12 @@ class Diving48Dataset(IterableDataset):
             video_id = ann.get("vid_name", ann.get("video_id", ann.get("id")))
             label = ann["label"]
             self.samples.append((video_id, label))
+
+        # Apply stratified subsampling if data_size < 1.0
+        if config.data_size < 1.0:
+            full_size = len(self.samples)
+            self.samples = stratified_subsample(self.samples, config.data_size, seed=config.seed)
+            print(f"Diving48Dataset [{split}]: Subsampled from {full_size} to {len(self.samples)} samples ({config.data_size*100:.1f}%)")
 
         # Load label names if provided (optional)
         self.label_names = None
@@ -823,6 +883,7 @@ class PrecomputedDatasetConfig(pydantic.BaseModel):
     global_batch_size: int
     rank: int = 0
     num_replicas: int = 1
+    data_size: float = 1.0
 
 
 class PrecomputedDatasetMetadata(pydantic.BaseModel):
@@ -871,6 +932,12 @@ class PrecomputedFeaturesDataset(IterableDataset):
                 # For precomputed, we store labels in the annotation
                 label = ann.get("label_id", 0)  # Fallback
                 self.samples.append((video_id, label))
+
+        # Apply stratified subsampling if data_size < 1.0
+        if config.data_size < 1.0:
+            full_size = len(self.samples)
+            self.samples = stratified_subsample(self.samples, config.data_size, seed=config.seed)
+            print(f"PrecomputedFeaturesDataset [{split}]: Subsampled from {full_size} to {len(self.samples)} samples ({config.data_size*100:.1f}%)")
 
         self.metadata = PrecomputedDatasetMetadata(
             feature_dim=1024,

@@ -74,6 +74,9 @@ class VideoPretrainConfig(pydantic.BaseModel):
     # Dataset selection: "ssv2" or "diving48"
     dataset: str = "ssv2"
 
+    # Data size to optimise parameters on less data
+    data_size: float = 1.0
+
     # Data paths
     data_root: str = "data/ssv2/videos"
     train_annotations: str = "data/ssv2/something-something-v2-train.json"
@@ -188,6 +191,7 @@ def create_video_dataloader(
             global_batch_size=config.global_batch_size,
             rank=rank,
             num_replicas=world_size,
+            data_size=config.data_size,
         )
         if config.dataset == "diving48":
             diving48_split = "test" if split == "validation" else split
@@ -216,6 +220,7 @@ def create_video_dataloader(
             global_batch_size=config.global_batch_size,
             rank=rank,
             num_replicas=world_size,
+            data_size=config.data_size,
         )
         return create_diving48_dataloader(
             dataset_config, diving48_split,
@@ -234,6 +239,7 @@ def create_video_dataloader(
             global_batch_size=config.global_batch_size,
             rank=rank,
             num_replicas=world_size,
+            data_size=config.data_size,
         )
         return create_ssv2_dataloader(
             dataset_config, split,
