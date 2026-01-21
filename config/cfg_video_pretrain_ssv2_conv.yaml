@@ -11,6 +11,7 @@ hydra:
 
 # Dataset selection
 dataset: ssv2
+data_size: 0.1 # default = 1 to train and validate on all the data
 
 # Data paths - Update these to your local SSv2 dataset location
 data_root: "C:\\Users\\Jason\\ai_data\\ssv2\\videos"
@@ -26,15 +27,15 @@ num_frames: 16  # V-JEPA 2 expects 64 frames
 frame_size: 256  # V-JEPA 2 crop size
 
 # Training hyperparams
-global_batch_size: 24  # Smaller than ARC due to video memory requirements
+global_batch_size: 16  # Smaller than ARC due to video memory requirements
 epochs: 15
-eval_interval: 1  # Evaluate every 5 epochs
+eval_interval: 1  # Evaluate every x epochs
 checkpoint_every_eval: True
 
 # Learning rate schedule
-lr: 3e-5
+lr: 8e-4
 lr_min_ratio: 0.1
-lr_warmup_steps: 1000
+lr_warmup_steps: 100
 
 # Optimizer settings
 beta1: 0.9
@@ -45,7 +46,7 @@ weight_decay: 0.1
 mixed_precision: True
 
 # Gradient accumulation (increase effective batch size)
-gradient_accumulation_steps: 3  # Effective batch size = 4 * 16 = 64
+gradient_accumulation_steps: 4  # Effective batch size = 4 * 16 = 64
 
 num_workers: 12
 prefetch_factor: 2

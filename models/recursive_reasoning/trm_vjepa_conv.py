@@ -79,6 +79,9 @@ class VJEPARecursiveConfig(BaseModel):
     # 3D-RoPE config for V-JEPA spatial-temporal structure
     grid_size: Tuple[int, int, int] = (32, 16, 16)  # (T, H, W) for V-JEPA 2
 
+    # Gating config
+    interpolated_gating: bool = False  # Upsample z_G to full resolution for softer boundaries
+
     forward_dtype: str = "bfloat16"
 
 
@@ -160,18 +163,32 @@ class ScalarGatedFeatureGrouping(nn.Module):
         Returns:
             output: (B, S, hidden_size) grouped and gated features
         """
-        B, S, _ = vjepa_features.shape
+        B, S, D = vjepa_features.shape
 
-        # Reshape to groups: (B, S, 1024) -> (B, S, 256, 4)
-        x = vjepa_features.view(B, S, -1, self.group_size)
+        if self.config.interpolated_gating:
+            # Interpolated gating: upsample z_G to full resolution for softer boundaries
+            # (B, S, hidden_size) -> (B*S, 1, hidden_size) -> interpolate -> (B*S, 1, D) -> (B, S, D)
+            z_G_flat = z_G.view(B * S, 1, -1)  # (B*S, 1, 256)
+            z_G_full = F.interpolate(
+                z_G_flat,
+                size=D,
+                mode='linear',
+                align_corners=True
+            ).view(B, S, D)  # (B, S, 1024)
 
-        # Sum each group: (B, S, 256, 4) -> (B, S, 256)
-        x = x.sum(dim=-1)
+            # Apply per-feature gating
+            gate = torch.sigmoid(z_G_full)
+            x = vjepa_features * gate  # (B, S, D)
 
-        # Apply z_G as scalar gate per group
-        gate = torch.sigmoid(z_G)
-
-        return x * gate
+            # Sum groups after gating
+            x = x.view(B, S, -1, self.group_size)  # (B, S, 256, 4)
+            return x.sum(dim=-1)  # (B, S, 256)
+        else:
+            # Original: hard group boundaries
+            x = vjepa_features.view(B, S, -1, self.group_size)  # (B, S, 256, 4)
+            x = x.sum(dim=-1)  # (B, S, 256)
+            gate = torch.sigmoid(z_G)
+            return x * gate
 
 
 class VJEPARecursiveClassifier_ACTV1_Inner(nn.Module):
